@@ -27,6 +27,7 @@ IMX                     | `imx`                     | yolo26n_imx_model/
 RKNN                    | `rknn`                    | yolo26n_rknn_model/
 ExecuTorch              | `executorch`              | yolo26n_executorch_model/
 Axelera AI              | `axelera`                 | yolo26n_axelera_model/
+Hailo                   | `hailo`                   | yolo26n_hailo_model/
 """
 
 from __future__ import annotations
@@ -174,6 +175,10 @@ def benchmark(
                 assert not (model.task == "segment" and any(isinstance(m, Segment26) for m in model.model.modules())), (
                     "Axelera export does not currently support YOLO26 segmentation models"
                 )
+            if format == "hailo":
+                assert not isinstance(model, YOLOWorld), "YOLOWorldv2 Hailo exports not supported"
+                assert LINUX, "Hailo export is only supported on Linux"
+                assert model.task == "detect", "Hailo export currently only supports the 'detect' task"
             if "cpu" in device.type:
                 assert cpu, "inference not supported on CPU"
             if "cuda" in device.type:
@@ -196,6 +201,7 @@ def benchmark(
             assert format not in {"edgetpu", "tfjs"}, "inference not supported"
             assert format != "coreml" or platform.system() == "Darwin", "inference only supported on macOS>=10.13"
             assert format != "axelera", "inference only supported on Axelera hardware"
+            assert format != "hailo", "inference only supported on Hailo hardware"
             exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
 
             # Validate

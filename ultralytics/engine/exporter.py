@@ -22,6 +22,7 @@ IMX                     | `imx`                     | yolo26n_imx_model/
 RKNN                    | `rknn`                    | yolo26n_rknn_model/
 ExecuTorch              | `executorch`              | yolo26n_executorch_model/
 Axelera AI              | `axelera`                 | yolo26n_axelera_model/
+Hailo                   | `hailo`                   | yolo26n_hailo_model/
 
 Requirements:
     $ pip install "ultralytics[export]"
@@ -52,6 +53,7 @@ Inference:
                          yolo26n_rknn_model         # RKNN
                          yolo26n_executorch_model   # ExecuTorch
                          yolo26n_axelera_model      # Axelera AI
+                         yolo26n_hailo_model        # Hailo
 
 TensorFlow.js:
     $ cd .. && git clone https://github.com/zldrobit/tfjs-yolov5-example.git && cd tfjs-yolov5-example
@@ -85,6 +87,7 @@ from ultralytics.nn.tasks import ClassificationModel, DetectionModel, Segmentati
 from ultralytics.utils import (
     ARM64,
     DEFAULT_CFG,
+    HAILO_CHIPS,
     IS_DOCKER,
     LINUX,
     LOGGER,
@@ -152,6 +155,7 @@ def export_formats():
         ["RKNN", "rknn", "_rknn_model", False, False, ["batch", "name"]],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"]],
         ["Axelera AI", "axelera", "_axelera_model", False, False, ["batch", "int8", "fraction", "data"]],
+        ["Hailo", "hailo", "_hailo_model", False, False, ["batch", "int8", "fraction", "data", "name"]],
     ]
     return dict(zip(["Format", "Argument", "Suffix", "CPU", "GPU", "Arguments"], zip(*x)))
 
@@ -240,6 +244,7 @@ class Exporter:
         export_imx: Export model to IMX format.
         export_executorch: Export model to ExecuTorch format.
         export_axelera: Export model to Axelera format.
+        export_hailo: Export model to Hailo HEF format.
 
     Examples:
         Export a YOLO26 model to ONNX format
@@ -328,6 +333,26 @@ class Exporter:
                 raise ValueError(
                     "IMX export only supported for detection, pose estimation, classification, and segmentation models."
                 )
+        if fmt == "hailo":
+            assert LINUX, "Hailo export is only supported on Linux."
+            if model.task != "detect":
+                raise ValueError(
+                    f"Hailo export currently only supports the 'detect' task (YOLOv8 / YOLO26), got task='{model.task}'."
+                )
+            if not self.args.int8:
+                LOGGER.warning("Setting int8=True for Hailo quantization.")
+                self.args.int8 = True
+            if not self.args.data:
+                self.args.data = TASK2CALIBRATIONDATA.get(model.task)
+            if not self.args.name:
+                LOGGER.warning(
+                    "Hailo export requires a missing 'name' arg for chip target. Using default name='hailo10h'."
+                )
+                self.args.name = "hailo10h"
+            self.args.name = self.args.name.lower()
+            assert self.args.name in HAILO_CHIPS, (
+                f"Invalid chip name '{self.args.name}' for Hailo export. Valid names are {sorted(HAILO_CHIPS)}."
+            )
         if not hasattr(model, "names"):
             model.names = default_class_names()
         model.names = check_class_names(model.names)
@@ -577,7 +602,12 @@ class Exporter:
             )
         if self.args.format == "axelera" and n < 100:
             LOGGER.warning(f"{prefix} >100 images required for Axelera calibration, found {n} images.")
-        elif self.args.format != "axelera" and n < 300:
+        elif self.args.format == "hailo" and n < 1024:
+            LOGGER.warning(
+                f"{prefix} >=1024 images recommended for optimal Hailo calibration accuracy, found {n} images. "
+                f"Increase 'fraction' or use a larger 'data' dataset."
+            )
+        elif self.args.format not in {"axelera", "hailo"} and n < 300:
             LOGGER.warning(f"{prefix} >300 images recommended for INT8 calibration, found {n} images.")
         return build_dataloader(dataset, batch=batch, workers=0, drop_last=True)  # required for batch loading
 
@@ -973,6 +1003,37 @@ class Exporter:
             transform_fn=self._transform_fn,
             model_name=self.file.stem,
             metadata=self.metadata,
+            prefix=prefix,
+        )
+
+    @try_export
+    def export_hailo(self, prefix=colorstr("Hailo:")):
+        """Export YOLO model to Hailo HEF format via the Hailo Dataflow Compiler."""
+        from ultralytics.utils.export.hailo import _dataloader_to_numpy, onnx2hailo
+
+        prev_opset, self.args.opset = self.args.opset, min(self.args.opset or 17, 17)  # Hailo DFC opset cap
+        try:
+            f_onnx = self.export_onnx()
+        finally:
+            self.args.opset = prev_opset
+        calibration = _dataloader_to_numpy(self.get_int8_calibration_dataloader(prefix))
+
+        # The HailoBackend decodes both on-chip NMS and YOLO26 end2end outputs into the (B, N, 6) format
+        self.metadata["end2end"] = True
+
+        return onnx2hailo(
+            onnx_file=f_onnx,
+            output_dir=str(self.file).replace(self.file.suffix, f"_hailo_model{os.sep}"),
+            hw_arch=self.args.name,
+            task=self.model.task,
+            end2end=getattr(self.model, "end2end", False),
+            calibration_data=calibration,
+            conf=self.args.conf,
+            iou=self.args.iou,
+            max_det=self.args.max_det,
+            num_classes=len(self.model.names),
+            metadata=self.metadata,
+            model_name=self.file.stem,
             prefix=prefix,
         )
 

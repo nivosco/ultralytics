@@ -382,3 +382,18 @@ def test_export_axelera():
     assert Path(file).exists(), f"Axelera export failed, directory not found: {file}"
     # Note: Inference testing skipped as it requires Axelera hardware
     shutil.rmtree(file, ignore_errors=True)  # cleanup
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not LINUX, reason="Hailo export is only supported on Linux")
+def test_export_hailo():
+    """Test YOLO export to Hailo HEF format."""
+    import importlib.util
+    if importlib.util.find_spec("hailo_sdk_client") is None:
+        pytest.skip("Hailo Dataflow Compiler ('hailo_sdk_client') not installed")
+    file = YOLO(MODEL).export(format="hailo", imgsz=64, data="coco8.yaml", name="hailo10h")
+    assert Path(file).exists(), f"Hailo export failed, directory not found: {file}"
+    assert next(Path(file).rglob("*.hef"), None) is not None, f"No .hef found under: {file}"
+    assert (Path(file) / "metadata.yaml").exists(), f"metadata.yaml missing under: {file}"
+    # Note: Inference testing skipped as it requires Hailo hardware
+    shutil.rmtree(file, ignore_errors=True)
