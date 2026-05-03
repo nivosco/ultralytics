@@ -21,11 +21,11 @@ class HailoBackend(BaseBackend):
     The standard Ultralytics predict pipeline emits float32 ``[0, 1]`` tensors, which this backend silently
     casts back to uint8.
 
-    HEFs are produced by the Ultralytics exporter with ``nms_postprocess(meta_arch="yolov8")`` for the
-    YOLOv8 and YOLOv11 detect heads. On-chip NMS emits per-class detection lists of shape
-    ``(num_classes, max_proposals_per_class, 5)``, which this backend decodes into Ultralytics'
-    end-to-end ``(1, N, 6)`` format ``[x1, y1, x2, y2, conf, cls]`` in input-pixel coords, so the
-    existing predictor end2end short path consumes them directly.
+    HEFs are produced by the Ultralytics exporter with ``nms_postprocess(meta_arch=yolov8)`` for the
+    YOLOv8 and YOLOv11 detect heads. On-chip NMS emits a per-class list (length ``num_classes``) of
+    ``(N_class, 5)`` arrays, which this backend decodes into Ultralytics' end-to-end ``(1, N, 6)`` format
+    ``[x1, y1, x2, y2, conf, cls]`` in input-pixel coords, so the existing predictor end2end short path
+    consumes them directly.
     """
 
     def load_model(self, weight: str | Path) -> None:
@@ -39,7 +39,7 @@ class HailoBackend(BaseBackend):
         except ImportError as e:
             raise ImportError(
                 "HailoRT ('hailo_platform') is required for Hailo inference but is not installed.\n"
-                "Download HailoRT (free Hailo Developer Zone account required) from:\n"
+                "Download HailoRT from:\n"
                 "  https://hailo.ai/developer-zone/software-downloads/\n"
                 "Install the runtime package AND the driver matching your hardware:\n"
                 "  - PCIe driver for M.2 / mPCIe accelerator modules\n"
@@ -102,23 +102,21 @@ class HailoBackend(BaseBackend):
         self._configured.run([self._bindings], 10_000)  # 10 second timeout
         raw = self._bindings.output().get_buffer()
 
-        # On-chip nms_postprocess(meta_arch="yolov8") emits (num_classes, max_proposals_per_class, 5):
-        # [ymin, xmin, ymax, xmax, score] in normalized [0, 1].
-        if raw.ndim == 3 and raw.shape[-1] == 5:
-            return [self._decode_nms(raw, imgsz_h, imgsz_w)]
-        raise RuntimeError(
-            f"Unrecognized HEF output shape {raw.shape} (dtype={raw.dtype}). HailoBackend's decoder handles "
-            f"only on-chip NMS output of shape (num_classes, max_proposals, 5)."
-        )
+        # nms_postprocess(meta_arch=yolov8, engine=cpu) returns list[ndarray] of length num_classes, each
+        # (N_class, 5) with [ymin, xmin, ymax, xmax, score] in normalized [0, 1]. Some SDK builds wrap that
+        # in an outer batch list — unwrap if so.
+        if isinstance(raw, list) and raw and isinstance(raw[0], list):
+            raw = raw[0]
+        return [self._decode_nms(raw, imgsz_h, imgsz_w)]
 
     @staticmethod
-    def _decode_nms(buf: np.ndarray, imgsz_h: int, imgsz_w: int) -> np.ndarray:
+    def _decode_nms(per_class: list, imgsz_h: int, imgsz_w: int) -> np.ndarray:
         """Convert the on-chip NMS-postprocess output to end2end ``(1, N, 6)`` predictions.
 
         Args:
-            buf (np.ndarray): Hailo NMS buffer of shape ``(num_classes, max_proposals_per_class, 5)`` with
-                ``[ymin, xmin, ymax, xmax, score]`` in normalized ``[0, 1]`` coords. Unused proposal slots
-                are zero-padded.
+            per_class (list): List of length ``num_classes``; element ``i`` is an ``(N_i, 5)`` array of
+                ``[ymin, xmin, ymax, xmax, score]`` in normalized ``[0, 1]`` coords for class ``i``. Empty
+                arrays / None entries indicate no detections for that class.
             imgsz_h (int): Network input height in pixels.
             imgsz_w (int): Network input width in pixels.
 
@@ -126,14 +124,11 @@ class HailoBackend(BaseBackend):
             (np.ndarray): ``(1, N, 6)`` float32 array of ``[x1, y1, x2, y2, conf, cls]`` in input-pixel
             coords, sorted by descending confidence.
         """
-        nc = buf.shape[0]
         rows = []
-        for cls_idx in range(nc):
-            cls_dets = buf[cls_idx]
-            valid = cls_dets[:, 4] > 0  # zero score means empty slot
-            if not valid.any():
+        for cls_idx, cls_dets in enumerate(per_class):
+            if cls_dets is None or len(cls_dets) == 0:
                 continue
-            d = cls_dets[valid]
+            d = np.asarray(cls_dets, dtype=np.float32)
             x1 = d[:, 1] * imgsz_w
             y1 = d[:, 0] * imgsz_h
             x2 = d[:, 3] * imgsz_w
