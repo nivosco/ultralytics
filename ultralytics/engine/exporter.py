@@ -1043,6 +1043,7 @@ class Exporter:
         # can attach. This sidesteps PyTorch-version-specific shape inference in DFL/dist2bbox that
         # otherwise breaks the Hailo parser (e.g. PT 2.9 emits non-broadcastable Sub/Add constants).
         head_module_name = ".".join(list(self.model.named_modules())[-1][0].split(".")[:2])
+        detect_head = self.model.model[-1]
 
         return onnx2hailo(
             onnx_file=f_onnx,
@@ -1054,6 +1055,8 @@ class Exporter:
             iou=self.args.iou,
             num_classes=len(self.model.names),
             imgsz=tuple(self.imgsz),
+            max_det=self.args.max_det,
+            reg_max=getattr(detect_head, "reg_max", 16),
             metadata=self.metadata,
             model_name=self.file.stem,
             head_module_name=head_module_name,

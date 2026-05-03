@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -13,10 +14,7 @@ from ultralytics.utils import LOGGER, YAML
 def _resolve_model_script(
     model_script: str | Path | None,
     task: str,
-    conf: float,
-    iou: float,
-    num_classes: int,
-    imgsz: tuple[int, int],
+    nms_config_path: str | Path | None,
 ) -> str:
     """Return the Hailo model script ('alls') content to load into the compiler.
 
@@ -24,12 +22,8 @@ def _resolve_model_script(
         model_script (str | Path | None): User override. Path to an alls file, raw alls content,
             or None to auto-generate.
         task (str): Ultralytics task (only ``"detect"`` is supported in this initial release).
-        conf (float): Score threshold for the on-chip NMS layer.
-        iou (float): IoU threshold for the on-chip NMS layer.
-        num_classes (int): Number of object classes.
-        imgsz (tuple[int, int]): Model input size as ``(height, width)``. Passed to ``nms_postprocess`` as
-            ``image_dims`` so the macro pairs conv branches by stride against the actual model input
-            instead of the bundled meta_arch config's default 640x640.
+        nms_config_path (str | Path | None): Path to a meta_arch=yolov8 JSON config containing NMS
+            thresholds, image_dims, and bbox_decoder layer mappings. Required when ``model_script`` is None.
 
     Returns:
         (str): The alls script content.
@@ -58,12 +52,83 @@ def _resolve_model_script(
     optimization = "model_optimization_flavor(optimization_level=2, compression_level=0)"
     # The chip divides input by 255 internally, so the calibration / inference API expects RGB uint8 [0, 255].
     normalization = "normalization1 = normalization([0.0, 0.0, 0.0], [255.0, 255.0, 255.0])"
-    nms_postprocess = (
-        f"nms_postprocess(meta_arch=yolov8, engine=cpu, "
-        f"nms_scores_th={float(conf)}, nms_iou_th={float(iou)}, "
-        f"classes={int(num_classes)})"
-    )
+    nms_postprocess = f'nms_postprocess("{nms_config_path}", meta_arch=yolov8, engine=cpu)'
     return f"{optimization}\n{normalization}\n{nms_postprocess}\n"
+
+
+def _build_nms_config(
+    runner,
+    conf: float,
+    iou: float,
+    num_classes: int,
+    imgsz: tuple[int, int],
+    max_det: int,
+    reg_max: int,
+) -> dict:
+    """Build the ``meta_arch=yolov8`` JSON config for ``nms_postprocess`` from the parsed HailoNN.
+
+    Inspects the HailoNN that came out of ``translate_onnx_model`` to find the 6 conv leaves of the Detect
+    head (3 strides x {box reg, class logits}), classifies each by output channel count, sorts by spatial
+    dim to recover stride order, and emits a config dict the SDK expects.
+
+    Args:
+        runner: HailoSDK ``ClientRunner`` after ``translate_onnx_model`` has run.
+        conf (float): NMS score threshold.
+        iou (float): NMS IoU threshold.
+        num_classes (int): Number of object classes (matches cls conv channel count).
+        imgsz (tuple[int, int]): Model input ``(height, width)``.
+        max_det (int): Max proposals per class for on-chip NMS.
+        reg_max (int): DFL ``reg_max`` (default 16 for YOLOv8). Box reg conv channel count is ``4 * reg_max``.
+
+    Returns:
+        (dict): JSON-serializable config dict ready to pass to ``nms_postprocess``.
+
+    Raises:
+        RuntimeError: If 3 box-reg and 3 class conv leaves cannot be located in the parsed HailoNN.
+    """
+    hn = runner.get_hn_model()
+    reg_channels = 4 * reg_max
+    reg_layers, cls_layers = [], []
+    for output in hn.get_output_layers():
+        for pred in hn.predecessors(output):
+            channels = pred.output_shapes[0][-1]  # NHWC
+            if channels == reg_channels:
+                reg_layers.append(pred)
+            elif channels == num_classes:
+                cls_layers.append(pred)
+
+    if len(reg_layers) != 3 or len(cls_layers) != 3:
+        raise RuntimeError(
+            f"Expected 3 box-reg ({reg_channels} ch) + 3 cls ({num_classes} ch) conv leaves at HailoNN "
+            f"outputs, found {len(reg_layers)} reg / {len(cls_layers)} cls. Cannot auto-build the "
+            f"nms_postprocess JSON config; pass a custom alls via model_script=."
+        )
+
+    # Sort by spatial dim descending: largest = stride 8, then 16, then 32
+    reg_layers.sort(key=lambda layer: -layer.output_shapes[0][1])
+    cls_layers.sort(key=lambda layer: -layer.output_shapes[0][1])
+
+    strides = (8, 16, 32)
+    bbox_decoders = [
+        {
+            "name": f"bbox_decoder{i}",
+            "stride": stride,
+            "reg_layer": reg.name,
+            "cls_layer": cls.name,
+        }
+        for i, (stride, reg, cls) in enumerate(zip(strides, reg_layers, cls_layers))
+    ]
+
+    return {
+        "nms_scores_th": float(conf),
+        "nms_iou_th": float(iou),
+        "image_dims": [int(imgsz[0]), int(imgsz[1])],
+        "max_proposals_per_class": int(max_det),
+        "classes": int(num_classes),
+        "regression_length": int(reg_max),
+        "background_removal": False,
+        "bbox_decoders": bbox_decoders,
+    }
 
 
 def _dataloader_to_numpy(dataloader) -> np.ndarray:
@@ -99,6 +164,8 @@ def onnx2hailo(
     iou: float = 0.7,
     num_classes: int = 80,
     imgsz: tuple[int, int] = (640, 640),
+    max_det: int = 300,
+    reg_max: int = 16,
     metadata: dict | None = None,
     model_name: str = "model",
     head_module_name: str | None = None,
@@ -115,12 +182,16 @@ def onnx2hailo(
         hw_arch (str): Hailo hardware target (one of ``HAILO_CHIPS``).
         task (str): Ultralytics task. Only ``"detect"`` is supported in this release.
         calibration_data (np.ndarray): (N, H, W, C) RGB uint8 calibration array [0-255].
-        model_script (str | Path | None): Optional alls override (file path or raw alls content).
-        conf (float): NMS score threshold passed to ``nms_postprocess`` as ``nms_scores_th``.
-        iou (float): NMS IoU threshold passed to ``nms_postprocess`` as ``nms_iou_th``.
+        model_script (str | Path | None): Optional alls override (file path or raw alls content). When
+            provided, the auto-generated NMS JSON config is skipped entirely.
+        conf (float): NMS score threshold (``nms_scores_th`` in the JSON config).
+        iou (float): NMS IoU threshold (``nms_iou_th`` in the JSON config).
         num_classes (int): Number of object classes.
-        imgsz (tuple[int, int]): Model input ``(height, width)``. Forwarded to ``nms_postprocess`` as
-            ``image_dims`` so branch pairing uses the actual input size, not the bundled config's default.
+        imgsz (tuple[int, int]): Model input ``(height, width)``. Written into the JSON config's
+            ``image_dims`` so branch pairing uses the actual input size.
+        max_det (int): Max proposals per class for on-chip NMS (``max_proposals_per_class`` in the JSON).
+        reg_max (int): DFL ``reg_max`` (default 16 for YOLOv8). Used to identify box-reg conv leaves by
+            channel count (``4 * reg_max``).
         metadata (dict | None): Metadata to persist alongside the HEF as ``metadata.yaml``.
         model_name (str): Name of the compiled HEF (without extension).
         head_module_name (str | None): Detect head module name (e.g. ``"model.22"``). When set, the parser is
@@ -178,7 +249,13 @@ def onnx2hailo(
         ]
     runner.translate_onnx_model(onnx_file, model_name, **translate_kwargs)
 
-    alls = _resolve_model_script(model_script, task, conf, iou, num_classes, imgsz)
+    nms_config_path: Path | None = None
+    if model_script is None and task == "detect":
+        nms_config = _build_nms_config(runner, conf, iou, num_classes, imgsz, max_det, reg_max)
+        nms_config_path = output_dir / f"{model_name}_nms_config.json"
+        nms_config_path.write_text(json.dumps(nms_config, indent=2))
+
+    alls = _resolve_model_script(model_script, task, nms_config_path)
     runner.load_model_script(alls)
     runner.optimize(calibration_data)
 
