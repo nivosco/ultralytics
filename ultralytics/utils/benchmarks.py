@@ -33,6 +33,7 @@ Hailo                   | `hailo`                   | yolo26n_hailo_model/
 from __future__ import annotations
 
 import glob
+import importlib.util
 import os
 import platform
 import re
@@ -201,7 +202,9 @@ def benchmark(
             assert format not in {"edgetpu", "tfjs"}, "inference not supported"
             assert format != "coreml" or platform.system() == "Darwin", "inference only supported on macOS>=10.13"
             assert format != "axelera", "inference only supported on Axelera hardware"
-            assert format != "hailo", "inference only supported on Hailo hardware"
+            assert format != "hailo" or importlib.util.find_spec("hailo_platform") is not None, (
+                "inference only supported on Hailo hardware (HailoRT 'hailo_platform' not installed)"
+            )
             exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
 
             # Validate

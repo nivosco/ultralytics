@@ -223,8 +223,11 @@ def onnx2hailo(
         from hailo_sdk_client import ClientRunner
     except ImportError as e:
         raise ImportError(
-            "Hailo Dataflow Compiler ('hailo_sdk_client') is required for Hailo export but is not installed. "
-            "Install it from the Hailo Developer Zone: https://hailo.ai/developer-zone/"
+            "Hailo Dataflow Compiler ('hailo_sdk_client') is required for Hailo export but is not installed.\n"
+            "Download the DFC installer from:\n"
+            "  https://hailo.ai/developer-zone/software-downloads/\n"
+            "and follow the install instructions in the bundled user guide. The DFC is not on PyPI; manual "
+            "install is required. Once installed, re-run the export."
         ) from e
 
     output_dir = Path(output_dir)

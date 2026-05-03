@@ -38,8 +38,13 @@ class HailoBackend(BaseBackend):
             from hailo_platform import VDevice
         except ImportError as e:
             raise ImportError(
-                "HailoRT ('hailo_platform') is required for Hailo inference but is not installed. "
-                "Install it from the Hailo Developer Zone: https://hailo.ai/developer-zone/"
+                "HailoRT ('hailo_platform') is required for Hailo inference but is not installed.\n"
+                "Download HailoRT (free Hailo Developer Zone account required) from:\n"
+                "  https://hailo.ai/developer-zone/software-downloads/\n"
+                "Install the runtime package AND the driver matching your hardware:\n"
+                "  - PCIe driver for M.2 / mPCIe accelerator modules\n"
+                "  - USB driver for USB dongle accelerators\n"
+                "then re-run inference. HailoRT is not on PyPI; manual install is required."
             ) from e
 
         w = Path(weight)
@@ -89,7 +94,8 @@ class HailoBackend(BaseBackend):
         else:
             x = (im.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
 
-        # AutoBackend permutes BCHW → BHWC, so im.shape is (B, H, W, C).
+        x = np.ascontiguousarray(x)
+        # im.shape is (B, H, W, C) post-permute.
         imgsz_h, imgsz_w = int(x.shape[1]), int(x.shape[2])
 
         self._bindings.input().set_buffer(x)
