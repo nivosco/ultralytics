@@ -99,6 +99,7 @@ def onnx2hailo(
     num_classes: int = 80,
     metadata: dict | None = None,
     model_name: str = "model",
+    head_module_name: str | None = None,
     prefix: str = "",
 ) -> str:
     """Compile an ONNX YOLO model to a Hailo HEF using the Hailo Dataflow Compiler.
@@ -119,6 +120,9 @@ def onnx2hailo(
         num_classes (int): Number of object classes.
         metadata (dict | None): Metadata to persist alongside the HEF as ``metadata.yaml``.
         model_name (str): Name of the compiled HEF (without extension).
+        head_module_name (str | None): Detect head module name (e.g. ``"model.22"``). When set, the parser is
+            cut at the head's ``Sigmoid`` and ``Concat`` leaves so ``nms_postprocess(meta_arch="yolov8")``
+            attaches cleanly, avoiding PyTorch-version-specific shape ops in the DFL/decode subgraph.
         prefix (str): Prefix for log messages.
 
     Returns:
@@ -155,7 +159,13 @@ def onnx2hailo(
     LOGGER.info(f"\n{prefix} starting export with Hailo Dataflow Compiler (hw_arch={hw_arch})...")
 
     runner = ClientRunner(hw_arch=hw_arch)
-    runner.translate_onnx_model(onnx_file, model_name)
+    translate_kwargs: dict = {}
+    if head_module_name:
+        translate_kwargs["end_node_names"] = [
+            f"/{head_module_name}/Sigmoid",
+            f"/{head_module_name}/Concat",
+        ]
+    runner.translate_onnx_model(onnx_file, model_name, **translate_kwargs)
 
     alls = _resolve_model_script(model_script, task, conf, iou, max_det, num_classes)
     runner.load_model_script(alls)

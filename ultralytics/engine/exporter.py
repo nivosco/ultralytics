@@ -1039,6 +1039,11 @@ class Exporter:
         # predictor consumes it via the end2end short path.
         self.metadata["end2end"] = True
 
+        # Cut the ONNX at the Detect head's cv2/cv3 leaves so nms_postprocess(meta_arch="yolov8")
+        # can attach. This sidesteps PyTorch-version-specific shape inference in DFL/dist2bbox that
+        # otherwise breaks the Hailo parser (e.g. PT 2.9 emits non-broadcastable Sub/Add constants).
+        head_module_name = ".".join(list(self.model.named_modules())[-1][0].split(".")[:2])
+
         return onnx2hailo(
             onnx_file=f_onnx,
             output_dir=str(self.file).replace(self.file.suffix, f"_hailo_model{os.sep}"),
@@ -1051,6 +1056,7 @@ class Exporter:
             num_classes=len(self.model.names),
             metadata=self.metadata,
             model_name=self.file.stem,
+            head_module_name=head_module_name,
             prefix=prefix,
         )
 
