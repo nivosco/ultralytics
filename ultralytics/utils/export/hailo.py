@@ -15,8 +15,8 @@ def _resolve_model_script(
     task: str,
     conf: float,
     iou: float,
-    max_det: int,
     num_classes: int,
+    imgsz: tuple[int, int],
 ) -> str:
     """Return the Hailo model script ('alls') content to load into the compiler.
 
@@ -26,8 +26,10 @@ def _resolve_model_script(
         task (str): Ultralytics task (only ``"detect"`` is supported in this initial release).
         conf (float): Score threshold for the on-chip NMS layer.
         iou (float): IoU threshold for the on-chip NMS layer.
-        max_det (int): Max proposals per class for the on-chip NMS layer.
         num_classes (int): Number of object classes.
+        imgsz (tuple[int, int]): Model input size as ``(height, width)``. Passed to ``nms_postprocess`` as
+            ``image_dims`` so the macro pairs conv branches by stride against the actual model input
+            instead of the bundled meta_arch config's default 640x640.
 
     Returns:
         (str): The alls script content.
@@ -57,9 +59,9 @@ def _resolve_model_script(
     # The chip divides input by 255 internally, so the calibration / inference API expects RGB uint8 [0, 255].
     normalization = "normalization1 = normalization([0.0, 0.0, 0.0], [255.0, 255.0, 255.0])"
     nms_postprocess = (
-        'nms_postprocess(meta_arch="yolov8", engine="cpu", '
+        f"nms_postprocess(meta_arch=yolov8, engine=cpu, "
         f"nms_scores_th={float(conf)}, nms_iou_th={float(iou)}, "
-        f"classes={int(num_classes)}, max_proposals_per_class={int(max_det)})"
+        f"classes={int(num_classes)})"
     )
     return f"{optimization}\n{normalization}\n{nms_postprocess}\n"
 
@@ -95,8 +97,8 @@ def onnx2hailo(
     model_script: str | Path | None = None,
     conf: float = 0.25,
     iou: float = 0.7,
-    max_det: int = 300,
     num_classes: int = 80,
+    imgsz: tuple[int, int] = (640, 640),
     metadata: dict | None = None,
     model_name: str = "model",
     head_module_name: str | None = None,
@@ -104,7 +106,7 @@ def onnx2hailo(
 ) -> str:
     """Compile an ONNX YOLO model to a Hailo HEF using the Hailo Dataflow Compiler.
 
-    Supports YOLOv8 and YOLOv11 detect heads directly via the ``nms_postprocess(meta_arch="yolov8")``
+    Supports YOLOv8 and YOLOv11 detect heads directly via the ``nms_postprocess(meta_arch=yolov8)``
     macro, which adds on-chip NMS to the compiled HEF.
 
     Args:
@@ -114,15 +116,16 @@ def onnx2hailo(
         task (str): Ultralytics task. Only ``"detect"`` is supported in this release.
         calibration_data (np.ndarray): (N, H, W, C) RGB uint8 calibration array [0-255].
         model_script (str | Path | None): Optional alls override (file path or raw alls content).
-        conf (float): NMS score threshold.
-        iou (float): NMS IoU threshold.
-        max_det (int): NMS max proposals per class.
+        conf (float): NMS score threshold passed to ``nms_postprocess`` as ``nms_scores_th``.
+        iou (float): NMS IoU threshold passed to ``nms_postprocess`` as ``nms_iou_th``.
         num_classes (int): Number of object classes.
+        imgsz (tuple[int, int]): Model input ``(height, width)``. Forwarded to ``nms_postprocess`` as
+            ``image_dims`` so branch pairing uses the actual input size, not the bundled config's default.
         metadata (dict | None): Metadata to persist alongside the HEF as ``metadata.yaml``.
         model_name (str): Name of the compiled HEF (without extension).
         head_module_name (str | None): Detect head module name (e.g. ``"model.22"``). When set, the parser is
-            cut at the head's ``Sigmoid`` and ``Concat`` leaves so ``nms_postprocess(meta_arch="yolov8")``
-            attaches cleanly, avoiding PyTorch-version-specific shape ops in the DFL/decode subgraph.
+            cut at the head's 6 cv2/cv3 conv leaves so ``nms_postprocess(meta_arch=yolov8)`` attaches
+            cleanly, avoiding PyTorch-version-specific shape ops in the DFL/decode subgraph.
         prefix (str): Prefix for log messages.
 
     Returns:
@@ -161,13 +164,21 @@ def onnx2hailo(
     runner = ClientRunner(hw_arch=hw_arch)
     translate_kwargs: dict = {}
     if head_module_name:
+        # Cut at the 6 raw conv leaves of the Detect head (3 strides × {box reg, class logits}). This is
+        # what nms_postprocess(meta_arch=yolov8) expects to attach to — it applies its own sigmoid + DFL
+        # decode + NMS internally. Cutting any later (e.g. at Sigmoid/Concat) makes the macro reject the
+        # graph with "expected conv but found activation layer".
         translate_kwargs["end_node_names"] = [
-            f"/{head_module_name}/Sigmoid",
-            f"/{head_module_name}/Concat",
+            name
+            for i in range(3)
+            for name in (
+                f"/{head_module_name}/cv2.{i}/cv2.{i}.2/Conv",
+                f"/{head_module_name}/cv3.{i}/cv3.{i}.2/Conv",
+            )
         ]
     runner.translate_onnx_model(onnx_file, model_name, **translate_kwargs)
 
-    alls = _resolve_model_script(model_script, task, conf, iou, max_det, num_classes)
+    alls = _resolve_model_script(model_script, task, conf, iou, num_classes, imgsz)
     runner.load_model_script(alls)
     runner.optimize(calibration_data)
 

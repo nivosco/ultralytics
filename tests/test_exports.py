@@ -393,7 +393,7 @@ def test_export_hailo():
         pytest.skip("Hailo Dataflow Compiler ('hailo_sdk_client') not installed")
     # Hailo export is restricted to YOLOv8 / YOLOv11 in this release; tests/__init__'s MODEL is
     # yolo26n.pt which the family guard rejects, so use yolov8n.pt explicitly.
-    file = YOLO("yolov8n.pt").export(format="hailo", imgsz=64, data="coco8.yaml", name="hailo10h")
+    file = YOLO("yolov8n.pt").export(format="hailo", imgsz=640, data="coco8.yaml", name="hailo10h")
     assert Path(file).exists(), f"Hailo export failed, directory not found: {file}"
     assert next(Path(file).rglob("*.hef"), None) is not None, f"No .hef found under: {file}"
     assert (Path(file) / "metadata.yaml").exists(), f"metadata.yaml missing under: {file}"
