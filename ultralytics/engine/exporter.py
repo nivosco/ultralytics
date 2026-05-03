@@ -337,7 +337,24 @@ class Exporter:
             assert LINUX, "Hailo export is only supported on Linux."
             if model.task != "detect":
                 raise ValueError(
-                    f"Hailo export currently only supports the 'detect' task (YOLOv8 / YOLO26), got task='{model.task}'."
+                    f"Hailo export currently only supports the 'detect' task on YOLOv8 / YOLOv11, "
+                    f"got task='{model.task}'."
+                )
+            # Restrict to YOLOv8 and YOLOv11 in this initial release.
+            import re as _re
+
+            model_path = (
+                getattr(model, "pt_path", None)
+                or getattr(model, "yaml_file", None)
+                or (model.yaml.get("yaml_file", "") if hasattr(model, "yaml") else "")
+            )
+            stem = Path(str(model_path)).stem.lower() if model_path else ""
+            family_match = _re.match(r"^yolov?(\d+)", stem)
+            family = family_match.group(1) if family_match else None
+            if family not in {"8", "11"}:
+                raise NotImplementedError(
+                    f"Hailo export currently supports YOLOv8 and YOLOv11 detect models only "
+                    f"(model='{stem or '?'}' indicates family {family or 'unknown'})."
                 )
             if not self.args.int8:
                 LOGGER.warning("Setting int8=True for Hailo quantization.")
@@ -359,7 +376,7 @@ class Exporter:
         if hasattr(model, "end2end"):
             if self.args.end2end is not None:
                 model.end2end = self.args.end2end
-            if fmt in {"rknn", "ncnn", "executorch", "paddle", "imx", "edgetpu"}:
+            if fmt in {"rknn", "ncnn", "executorch", "paddle", "imx", "edgetpu", "hailo"}:
                 # Disable end2end branch for certain export formats as they does not support topk
                 model.end2end = False
                 LOGGER.warning(f"{fmt.upper()} export does not support end2end models, disabling end2end branch.")
@@ -1018,7 +1035,8 @@ class Exporter:
             self.args.opset = prev_opset
         calibration = _dataloader_to_numpy(self.get_int8_calibration_dataloader(prefix))
 
-        # The HailoBackend decodes both on-chip NMS and YOLO26 end2end outputs into the (B, N, 6) format
+        # HailoBackend decodes the on-chip NMS output into (B, N, 6); advertise end2end so the
+        # predictor consumes it via the end2end short path.
         self.metadata["end2end"] = True
 
         return onnx2hailo(
@@ -1026,7 +1044,6 @@ class Exporter:
             output_dir=str(self.file).replace(self.file.suffix, f"_hailo_model{os.sep}"),
             hw_arch=self.args.name,
             task=self.model.task,
-            end2end=getattr(self.model, "end2end", False),
             calibration_data=calibration,
             conf=self.args.conf,
             iou=self.args.iou,

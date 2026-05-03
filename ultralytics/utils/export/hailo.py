@@ -13,7 +13,6 @@ from ultralytics.utils import LOGGER, YAML
 def _resolve_model_script(
     model_script: str | Path | None,
     task: str,
-    end2end: bool,
     conf: float,
     iou: float,
     max_det: int,
@@ -24,12 +23,10 @@ def _resolve_model_script(
     Args:
         model_script (str | Path | None): User override. Path to an alls file, raw alls content,
             or None to auto-generate.
-        task (str): Ultralytics task (only "detect" is supported in this initial release).
-        end2end (bool): Whether the model has an integrated end2end head (YOLO26). When True the
-            chip emits final detections from the head and no on-chip NMS layer is added.
-        conf (float): Score threshold passed to the on-chip NMS layer (YOLOv8 only).
-        iou (float): IoU threshold passed to the on-chip NMS layer (YOLOv8 only).
-        max_det (int): Max proposals per class for the on-chip NMS layer (YOLOv8 only).
+        task (str): Ultralytics task (only ``"detect"`` is supported in this initial release).
+        conf (float): Score threshold for the on-chip NMS layer.
+        iou (float): IoU threshold for the on-chip NMS layer.
+        max_det (int): Max proposals per class for the on-chip NMS layer.
         num_classes (int): Number of object classes.
 
     Returns:
@@ -40,6 +37,9 @@ def _resolve_model_script(
         p = Path(s)
         if p.is_file():
             return p.read_text()
+        # Heuristic: alls scripts contain function calls (with newlines / parens). A short single-line value
+        # without parens is almost certainly a path the user meant to point at — fail loudly rather than
+        # ship the literal string to the compiler as alls content.
         if "\n" in s or "(" in s:
             return s
         raise FileNotFoundError(
@@ -53,17 +53,9 @@ def _resolve_model_script(
             f"Pass a custom alls via model_script= to compile other tasks."
         )
 
+    optimization = "model_optimization_flavor(optimization_level=2, compression_level=0)"
     # The chip divides input by 255 internally, so the calibration / inference API expects RGB uint8 [0, 255].
     normalization = "normalization1 = normalization([0.0, 0.0, 0.0], [255.0, 255.0, 255.0])"
-    if end2end:
-        # Optimization commands for the YOLO26 family
-        optimization = "model_optimization_flavor(optimization_level=4, compression_level=0)\n" \
-                       "quantization_param({dw*}, precision_mode=a16_w16)\n" \
-                       "quantization_param({output_layer*}, precision_mode=a16_w16)"
-        return f"{optimization}\n{normalization}\n"
-
-    # Optimization commands for the YOLOv8 family
-    optimization = "model_optimization_flavor(optimization_level=2, compression_level=0)"
     nms_postprocess = (
         'nms_postprocess(meta_arch="yolov8", engine="cpu", '
         f"nms_scores_th={float(conf)}, nms_iou_th={float(iou)}, "
@@ -99,7 +91,6 @@ def onnx2hailo(
     output_dir: Path | str,
     hw_arch: str = "hailo10h",
     task: str = "detect",
-    end2end: bool = False,
     calibration_data: np.ndarray | None = None,
     model_script: str | Path | None = None,
     conf: float = 0.25,
@@ -112,17 +103,19 @@ def onnx2hailo(
 ) -> str:
     """Compile an ONNX YOLO model to a Hailo HEF using the Hailo Dataflow Compiler.
 
+    Supports YOLOv8 and YOLOv11 detect heads directly via the ``nms_postprocess(meta_arch="yolov8")``
+    macro, which adds on-chip NMS to the compiled HEF.
+
     Args:
         onnx_file (str): Path to the source ONNX file.
         output_dir (Path | str): Directory to write the compiled ``<model_name>.hef`` and metadata.
         hw_arch (str): Hailo hardware target (one of ``HAILO_CHIPS``).
         task (str): Ultralytics task. Only ``"detect"`` is supported in this release.
-        end2end (bool): Whether the source model has an integrated end-to-end head (YOLO26).
         calibration_data (np.ndarray): (N, H, W, C) RGB uint8 calibration array [0-255].
         model_script (str | Path | None): Optional alls override (file path or raw alls content).
-        conf (float): NMS score threshold (YOLOv8 only).
-        iou (float): NMS IoU threshold (YOLOv8 only).
-        max_det (int): NMS max proposals per class (YOLOv8 only).
+        conf (float): NMS score threshold.
+        iou (float): NMS IoU threshold.
+        max_det (int): NMS max proposals per class.
         num_classes (int): Number of object classes.
         metadata (dict | None): Metadata to persist alongside the HEF as ``metadata.yaml``.
         model_name (str): Name of the compiled HEF (without extension).
@@ -164,7 +157,7 @@ def onnx2hailo(
     runner = ClientRunner(hw_arch=hw_arch)
     runner.translate_onnx_model(onnx_file, model_name)
 
-    alls = _resolve_model_script(model_script, task, end2end, conf, iou, max_det, num_classes)
+    alls = _resolve_model_script(model_script, task, conf, iou, max_det, num_classes)
     runner.load_model_script(alls)
     runner.optimize(calibration_data)
 

@@ -21,10 +21,11 @@ class HailoBackend(BaseBackend):
     The standard Ultralytics predict pipeline emits float32 ``[0, 1]`` tensors, which this backend silently
     casts back to uint8.
 
-    Outputs from a HEF compiled with ``nms_postprocess(meta_arch="yolov8")`` (per-class detection lists) are
-    decoded into Ultralytics' end-to-end ``(1, N, 6)`` format ``[x1, y1, x2, y2, conf, cls]`` in input pixel
-    coords, so the existing predictor end2end short path consumes them directly. HEFs whose graph already
-    emits ``(N, 6)`` (e.g. YOLO26 end2end) are wrapped with a batch dim and passed through.
+    HEFs are produced by the Ultralytics exporter with ``nms_postprocess(meta_arch="yolov8")`` for the
+    YOLOv8 and YOLOv11 detect heads. On-chip NMS emits per-class detection lists of shape
+    ``(num_classes, max_proposals_per_class, 5)``, which this backend decodes into Ultralytics'
+    end-to-end ``(1, N, 6)`` format ``[x1, y1, x2, y2, conf, cls]`` in input-pixel coords, so the
+    existing predictor end2end short path consumes them directly.
     """
 
     def load_model(self, weight: str | Path) -> None:
@@ -58,7 +59,7 @@ class HailoBackend(BaseBackend):
             stack.close()
             raise RuntimeError(
                 f"This HEF has {len(outputs)} outputs, but HailoBackend's decoder only handles single-output "
-                f"graphs (YOLOv8 with on-chip NMS or YOLO26 end2end)."
+                f"graphs produced by the auto-export path (post-NMS detection lists)."
             )
         self._out_shape = tuple(outputs[0].shape)
         self._out_buf = np.zeros(self._out_shape, dtype=np.float32)
@@ -80,10 +81,8 @@ class HailoBackend(BaseBackend):
                 chip's normalization layer; native ``uint8`` input is forwarded unchanged.
 
         Returns:
-            (list[np.ndarray]): Single-element list containing the decoded predictions tensor. For HEFs
-            with ``nms_postprocess(meta_arch="yolov8")`` the shape is ``(1, N, 6)`` in
-            ``[x1, y1, x2, y2, conf, cls]`` input-pixel coords; for end2end HEFs the chip output is wrapped
-            with a batch dim and passed through.
+            (list[np.ndarray]): Single-element list containing decoded predictions of shape ``(1, N, 6)``
+            in ``[x1, y1, x2, y2, conf, cls]`` input-pixel coords.
         """
         if im.dtype == torch.uint8:
             x = im.cpu().numpy()
@@ -97,21 +96,18 @@ class HailoBackend(BaseBackend):
         self._configured.run([self._bindings], 10_000)  # 10 second timeout
         raw = self._bindings.output().get_buffer()
 
-        # nms_postprocess(meta_arch="yolov8") emits (num_classes, max_proposals_per_class, 5):
+        # On-chip nms_postprocess(meta_arch="yolov8") emits (num_classes, max_proposals_per_class, 5):
         # [ymin, xmin, ymax, xmax, score] in normalized [0, 1].
         if raw.ndim == 3 and raw.shape[-1] == 5:
-            return [self._decode_chip_nms(raw, imgsz_h, imgsz_w)]
-        # YOLO26 end2end HEF: per-batch (max_det, 6) — already [x1,y1,x2,y2,conf,cls] in pixels. Add batch dim.
-        if raw.ndim == 2 and raw.shape[-1] == 6:
-            return [raw[None, ...].astype(np.float32, copy=False)]
+            return [self._decode_nms(raw, imgsz_h, imgsz_w)]
         raise RuntimeError(
             f"Unrecognized HEF output shape {raw.shape} (dtype={raw.dtype}). HailoBackend's decoder handles "
-            f"only YOLOv8 with on-chip NMS and YOLO26 end2end."
+            f"only on-chip NMS output of shape (num_classes, max_proposals, 5)."
         )
 
     @staticmethod
-    def _decode_chip_nms(buf: np.ndarray, imgsz_h: int, imgsz_w: int) -> np.ndarray:
-        """Convert on-chip NMS output to end2end ``(1, N, 6)`` predictions.
+    def _decode_nms(buf: np.ndarray, imgsz_h: int, imgsz_w: int) -> np.ndarray:
+        """Convert the on-chip NMS-postprocess output to end2end ``(1, N, 6)`` predictions.
 
         Args:
             buf (np.ndarray): Hailo NMS buffer of shape ``(num_classes, max_proposals_per_class, 5)`` with

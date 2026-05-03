@@ -1,15 +1,18 @@
 ---
 comments: true
-description: Deploy Ultralytics YOLO models on Hailo AI architectures. Compile YOLOv8 with on-chip NMS or YOLO26 end-to-end models to HEF and run them with HailoRT.
-keywords: Hailo, Hailo AI, Hailo-8, Hailo-10H, Hailo-15H, Hailo-15L, Hailo Dataflow Compiler, HailoRT, Edge AI, YOLOv8, YOLO26, Model Export, Computer Vision, Object Detection, quantization
+description: Deploy Ultralytics YOLO models on Hailo AI architectures. Compile YOLOv8 / YOLOv11 detection models to HEF with on-chip NMS, then run inference via HailoRT.
+keywords: Hailo, Hailo AI, Hailo-8, Hailo-10H, Hailo-15H, Hailo-15L, Hailo Dataflow Compiler, HailoRT, Edge AI, YOLOv8, YOLOv11, Model Export, Computer Vision, Object Detection, quantization
 ---
 
 # Hailo AI Export and Deployment
 
-Ultralytics supports exporting YOLO models to [Hailo](https://hailo.ai/) AI accelerators using the **Hailo Dataflow Compiler (DFC)** for compilation and **HailoRT** for runtime inference. Two model families are supported in this initial release:
+Ultralytics supports exporting YOLO models to [Hailo](https://hailo.ai/) AI accelerators using the **Hailo Dataflow Compiler (DFC)** for compilation and **HailoRT** for runtime inference.
 
-- **YOLOv8** detection models — compiled with on-chip NMS via the `nms_postprocess(meta_arch="yolov8")` model script macro, so the chip emits final detections directly.
-- **YOLO26** detection models — already end-to-end (the head's `postprocess()` produces final detections), so no on-chip NMS is required.
+## Supported models
+
+This initial release supports **YOLOv8 and YOLOv11 detect** models. Both share the same anchor-free DFL detection head and are compiled with the `nms_postprocess(meta_arch="yolov8")` model script macro, so NMS runs on-chip and the HEF emits final per-class detections directly.
+
+> **Other YOLO families** (YOLOv9 / YOLOv10 / YOLOv12 / YOLO26) are **not yet supported** — the export pipeline raises `NotImplementedError` if you attempt one. Tracked for a future release.
 
 ## Important: SDK installation
 
@@ -41,18 +44,16 @@ Pass the chip name via the `name=` argument:
 ```python
 from ultralytics import YOLO
 
-# YOLOv8 detect — on-chip NMS is added automatically by the auto-generated model script
+# Auto-generated alls adds nms_postprocess(meta_arch="yolov8") so NMS runs on-chip
 YOLO("yolov8n.pt").export(format="hailo", data="coco8.yaml", name="hailo10h", imgsz=640)
-
-# YOLO26 detect — end-to-end, no on-chip NMS needed
-YOLO("yolo26n.pt").export(format="hailo", data="coco8.yaml", name="hailo10h", imgsz=640)
+YOLO("yolo11n.pt").export(format="hailo", data="coco8.yaml", name="hailo10h", imgsz=640)
 ```
 
 ### CLI
 
 ```bash
 yolo export model=yolov8n.pt format=hailo data=coco8.yaml name=hailo10h imgsz=640
-yolo export model=yolo26n.pt format=hailo data=coco8.yaml name=hailo10h imgsz=640
+yolo export model=yolo11n.pt format=hailo data=coco8.yaml name=hailo10h imgsz=640
 ```
 
 The export produces a `<stem>_hailo_model/` directory containing `<stem>.hef` and `metadata.yaml`.
@@ -87,14 +88,11 @@ The high-level `YOLO(...).export(format="hailo")` path uses only the auto-genera
 ```python
 from ultralytics import YOLO
 
-model = YOLO("yolov8n_hailo_model")  # or "yolo26n_hailo_model"
+model = YOLO("yolov8n_hailo_model")  # or yolo11n_hailo_model
 results = model.predict("bus.jpg")
 ```
 
-The Hailo runtime expects raw RGB `uint8` `[0, 255]` input. The standard Ultralytics predict pipeline emits a normalized float tensor; the backend silently casts it back to uint8 on the host (matching the behavior of the Rockchip RKNN backend). Both supported HEF flavors are decoded into the predictor's end-to-end short path:
-
-- **YOLOv8 with on-chip NMS** — the chip emits per-class detection lists; the backend converts these to `(B, N, 6)` `[x1, y1, x2, y2, conf, cls]` in input-pixel coords and the predictor's end2end branch consumes them directly.
-- **YOLO26 end2end** — the chip's natural `(N, 6)` output is wrapped with a batch dim and passed through.
+The Hailo runtime expects raw RGB `uint8` `[0, 255]` input. The standard Ultralytics predict pipeline emits a normalized float tensor; the backend silently casts it back to uint8 (matching the behavior of the Rockchip RKNN backend). The chip's on-chip NMS emits per-class detection lists, which the backend converts to `(B, N, 6)` `[x1, y1, x2, y2, conf, cls]` in input-pixel coords and the predictor's end2end branch consumes them directly.
 
 ## Troubleshooting
 
