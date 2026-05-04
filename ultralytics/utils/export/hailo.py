@@ -9,6 +9,15 @@ import numpy as np
 import torch
 
 from ultralytics.utils import LOGGER, YAML
+from ultralytics.utils.downloads import safe_download
+
+# Hailo Model Zoo URL pattern for the YOLO26 quantization scripts. We fetch these per variant rather than
+# auto-generate, because the MZ alls is tuned for accuracy parity (mixed-precision a16_w16 layers, adaround,
+# higher optimization level than our default).
+HAILO_MZ_YOLO26_ALLS_URL = (
+    "https://raw.githubusercontent.com/hailo-ai/hailo_model_zoo/master/hailo_model_zoo/cfg/alls/generic/"
+    "yolo26{scale}.alls"
+)
 
 
 def _resolve_model_script(
@@ -19,11 +28,11 @@ def _resolve_model_script(
     """Return the Hailo model script ('alls') content to load into the compiler.
 
     Args:
-        model_script (str | Path | None): User override. Path to an alls file, raw alls content,
-            or None to auto-generate.
+        model_script (str | Path | None): User override or family-specific alls path. If a file path,
+            read its content; if it looks like alls content (multi-line / contains ``(``), pass through.
         task (str): Ultralytics task (only ``"detect"`` is supported in this initial release).
-        nms_config_path (str | Path | None): Path to a meta_arch=yolov8 JSON config containing NMS
-            thresholds, image_dims, and bbox_decoder layer mappings. Required when ``model_script`` is None.
+        nms_config_path (str | Path | None): Path to a ``meta_arch=yolov8`` NMS-postprocess JSON config.
+            Used only when ``model_script`` is None (yolov8 / yolo11 path); ignored otherwise.
 
     Returns:
         (str): The alls script content.
@@ -168,13 +177,20 @@ def onnx2hailo(
     reg_max: int = 16,
     metadata: dict | None = None,
     model_name: str = "model",
-    head_module_name: str | None = None,
+    model_family: str = "yolov8",
+    scale: str = "",
+    end_node_names: list[str] | None = None,
     prefix: str = "",
 ) -> str:
     """Compile an ONNX YOLO model to a Hailo HEF using the Hailo Dataflow Compiler.
 
-    Supports YOLOv8 and YOLOv11 detect heads directly via the ``nms_postprocess(meta_arch=yolov8)``
-    macro, which adds on-chip NMS to the compiled HEF.
+    Supports two model families with different on-chip / host-side splits:
+
+    - ``yolov8`` / ``yolo11`` detect heads — uses on-chip NMS via ``nms_postprocess(meta_arch=yolov8)``.
+      A JSON config is auto-built from the parsed HailoNN and emitted alongside the HEF.
+    - ``yolo26`` detect heads — NMS-free end2end. The Hailo NPU does not support topk/gather, so the
+      postprocess runs on host (see ``HailoBackend``). The alls is fetched from the Hailo Model Zoo
+      (``cfg/alls/generic/yolo26{scale}.alls``) for accuracy parity, no on-chip NMS attached.
 
     Args:
         onnx_file (str): Path to the source ONNX file.
@@ -183,20 +199,24 @@ def onnx2hailo(
         task (str): Ultralytics task. Only ``"detect"`` is supported in this release.
         calibration_data (np.ndarray): (N, H, W, C) RGB uint8 calibration array [0-255].
         model_script (str | Path | None): Optional alls override (file path or raw alls content). When
-            provided, the auto-generated NMS JSON config is skipped entirely.
-        conf (float): NMS score threshold (``nms_scores_th`` in the JSON config).
-        iou (float): NMS IoU threshold (``nms_iou_th`` in the JSON config).
+            provided, family-specific alls fetching and NMS JSON generation are skipped entirely.
+        conf (float): NMS score threshold (``nms_scores_th``).
+        iou (float): NMS IoU threshold (``nms_iou_th``).
         num_classes (int): Number of object classes.
-        imgsz (tuple[int, int]): Model input ``(height, width)``. Written into the JSON config's
-            ``image_dims`` so branch pairing uses the actual input size.
-        max_det (int): Max proposals per class for on-chip NMS (``max_proposals_per_class`` in the JSON).
-        reg_max (int): DFL ``reg_max`` (default 16 for YOLOv8). Used to identify box-reg conv leaves by
-            channel count (``4 * reg_max``).
-        metadata (dict | None): Metadata to persist alongside the HEF as ``metadata.yaml``.
+        imgsz (tuple[int, int]): Model input ``(height, width)``.
+        max_det (int): Max proposals per class for on-chip NMS / max detections for host postprocess.
+        reg_max (int): DFL ``reg_max`` (16 for YOLOv8, 1 for YOLO26).
+        metadata (dict | None): Metadata to persist alongside the HEF as ``metadata.yaml``. The function
+            adds family-specific postprocess params (``model_family``, ``strides``, ``reg_max``, etc.) so
+            ``HailoBackend`` can configure host-side decode at load time.
         model_name (str): Name of the compiled HEF (without extension).
-        head_module_name (str | None): Detect head module name (e.g. ``"model.22"``). When set, the parser is
-            cut at the head's 6 cv2/cv3 conv leaves so ``nms_postprocess(meta_arch=yolov8)`` attaches
-            cleanly, avoiding PyTorch-version-specific shape ops in the DFL/decode subgraph.
+        model_family (str): ``"yolov8"`` (default) or ``"yolo26"``. Selects the alls + decode path.
+        scale (str): YOLO26 scale letter — one of ``n`` / ``s`` / ``m`` / ``l`` (Hailo Model Zoo does not
+            publish an alls for ``x``). Required when ``model_family == "yolo26"`` and
+            ``model_script`` is None — used to fetch the matching alls from the Hailo Model Zoo.
+        end_node_names (list[str] | None): ONNX end-node names to cut the graph at. The caller computes
+            these because the conv-leaf prefix is family-specific (``cv2``/``cv3`` for yolov8,
+            ``one2one_cv2``/``one2one_cv3`` for yolo26).
         prefix (str): Prefix for log messages.
 
     Returns:
@@ -204,7 +224,7 @@ def onnx2hailo(
 
     Raises:
         ImportError: If the Hailo Dataflow Compiler is not installed.
-        ValueError: If calibration data is missing.
+        ValueError: If calibration data is missing or yolo26 scale is missing.
     """
     if calibration_data is None or len(calibration_data) == 0:
         raise ValueError("Calibration data is required for Hailo quantization.")
@@ -233,32 +253,57 @@ def onnx2hailo(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    LOGGER.info(f"\n{prefix} starting export with Hailo Dataflow Compiler (hw_arch={hw_arch})...")
+    LOGGER.info(
+        f"\n{prefix} starting export with Hailo Dataflow Compiler "
+        f"(hw_arch={hw_arch}, model_family={model_family})..."
+    )
 
     runner = ClientRunner(hw_arch=hw_arch)
     translate_kwargs: dict = {}
-    if head_module_name:
-        # Cut at the 6 raw conv leaves of the Detect head (3 strides × {box reg, class logits}). This is
-        # what nms_postprocess(meta_arch=yolov8) expects to attach to — it applies its own sigmoid + DFL
-        # decode + NMS internally. Cutting any later (e.g. at Sigmoid/Concat) makes the macro reject the
-        # graph with "expected conv but found activation layer".
-        translate_kwargs["end_node_names"] = [
-            name
-            for i in range(3)
-            for name in (
-                f"/{head_module_name}/cv2.{i}/cv2.{i}.2/Conv",
-                f"/{head_module_name}/cv3.{i}/cv3.{i}.2/Conv",
-            )
-        ]
+    if end_node_names:
+        translate_kwargs["end_node_names"] = list(end_node_names)
     runner.translate_onnx_model(onnx_file, model_name, **translate_kwargs)
 
     nms_config_path: Path | None = None
-    if model_script is None and task == "detect":
-        nms_config = _build_nms_config(runner, conf, iou, num_classes, imgsz, max_det, reg_max)
-        nms_config_path = output_dir / f"{model_name}_nms_config.json"
-        nms_config_path.write_text(json.dumps(nms_config, indent=2))
+    resolved_model_script: str | Path | None = model_script
 
-    alls = _resolve_model_script(model_script, task, nms_config_path)
+    if model_script is None and task == "detect":
+        if model_family == "yolo26":
+            # YOLO26: fetch the variant-specific alls from Hailo Model Zoo (no on-chip NMS, host postprocess).
+            if not scale:
+                raise ValueError(
+                    "model_family='yolo26' requires scale (n/s/m/l) to fetch the matching alls. "
+                    "Pass a custom alls via model_script= for non-standard variants."
+                )
+            alls_url = HAILO_MZ_YOLO26_ALLS_URL.format(scale=scale)
+            LOGGER.info(f"{prefix} fetching YOLO26 alls from Hailo Model Zoo: {alls_url}")
+            try:
+                resolved_model_script = safe_download(url=alls_url, dir=output_dir, exist_ok=True)
+            except Exception as e:
+                # safe_download retries 3x; surfacing here means the URL or the network is the issue.
+                # Reraise as a single clear RuntimeError so the user knows exactly what failed and how
+                # to work around it (custom alls path), instead of debugging a download stack trace.
+                raise RuntimeError(
+                    f"Failed to download the YOLO26 quantization script from the Hailo Model Zoo:\n"
+                    f"  url    : {alls_url}\n"
+                    f"  output : {output_dir}\n"
+                    f"  cause  : {type(e).__name__}: {e}\n"
+                    f"Common causes: (1) no internet / proxy blocking raw.githubusercontent.com, "
+                    f"(2) the Model Zoo restructured or removed yolo26{scale}.alls. "
+                    f"Workaround: download the alls manually and pass model_script=<path> to onnx2hailo."
+                ) from e
+            if not Path(resolved_model_script).is_file():
+                raise RuntimeError(
+                    f"Hailo Model Zoo alls download succeeded but no file was written at "
+                    f"{resolved_model_script!r}. Re-run, or pass model_script= explicitly to bypass the fetch."
+                )
+        else:
+            # yolov8 / yolo11: build the on-chip NMS JSON config from the parsed HailoNN.
+            nms_config = _build_nms_config(runner, conf, iou, num_classes, imgsz, max_det, reg_max)
+            nms_config_path = output_dir / f"{model_name}_nms_config.json"
+            nms_config_path.write_text(json.dumps(nms_config, indent=2))
+
+    alls = _resolve_model_script(resolved_model_script, task, nms_config_path)
     runner.load_model_script(alls)
     runner.optimize(calibration_data)
 
@@ -267,6 +312,21 @@ def onnx2hailo(
     hef_path.write_bytes(hef_bytes)
 
     if metadata is not None:
+        # Family-specific params HailoBackend needs at load time. yolov8's on-chip NMS path doesn't need
+        # most of these, but writing them for both keeps the metadata schema uniform.
+        metadata = dict(metadata)
+        metadata["model_family"] = model_family
+        if model_family == "yolo26":
+            metadata.update(
+                {
+                    "strides": [8, 16, 32],
+                    "reg_max": int(reg_max),
+                    "nc": int(num_classes),
+                    "max_det": int(max_det),
+                    "conf": float(conf),
+                    "imgsz": [int(imgsz[0]), int(imgsz[1])],
+                }
+            )
         YAML.save(output_dir / "metadata.yaml", metadata)
 
     return str(output_dir)

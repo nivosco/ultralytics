@@ -1,6 +1,6 @@
 ---
-description: Explore HailoBackend for Hailo AI hardware inference, deploying YOLO models on Hailo-8/8L/10H/15H/15M/15L accelerators with HailoRT and on-chip post-processing.
-keywords: Ultralytics, HailoBackend, Hailo AI, Hailo-8, Hailo-10H, Hailo-15H, Hailo-15L, HailoRT, AI accelerator, hardware inference, edge AI, deep learning acceleration
+description: Explore HailoBackend for Hailo AI hardware inference, deploying YOLOv8 / YOLO11 / YOLO26 models on Hailo-8/8L/10H/15H/15M/15L accelerators with HailoRT. Supports on-chip post-processing (yolov8 family) and host-side end2end decode (yolo26).
+keywords: Ultralytics, HailoBackend, Hailo AI, Hailo-8, Hailo-10H, Hailo-15H, Hailo-15L, HailoRT, YOLOv8, YOLO11, YOLO26, AI accelerator, hardware inference, edge AI, deep learning acceleration
 ---
 
 # Reference for `ultralytics/nn/backends/hailo.py`
