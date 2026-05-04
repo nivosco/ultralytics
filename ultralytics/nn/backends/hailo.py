@@ -70,11 +70,22 @@ class HailoBackend(BaseBackend):
         stack = ExitStack()
         vdevice = stack.enter_context(VDevice())
         self._infer_model = vdevice.create_infer_model(str(hef))
-        self._configured = stack.enter_context(self._infer_model.configure())
-        self._bindings = self._configured.create_bindings()
 
         outputs = self._infer_model.outputs
         outputs = outputs() if callable(outputs) else outputs
+
+        if self._model_family == "yolo26":
+            # YOLO26 ships with the Hailo Model Zoo's a16_w16 quantization on the conv leaves, so the
+            # raw chip outputs are uint16. Request FLOAT32 here so the SDK dequantizes on-the-fly and
+            # our host postprocess (anchors + dist2bbox + sigmoid + topk) consumes natural float values.
+            # Must be set BEFORE configure() — the binding format is locked in at that point.
+            from hailo_platform import FormatType
+
+            for o in outputs:
+                o.set_format_type(FormatType.FLOAT32)
+
+        self._configured = stack.enter_context(self._infer_model.configure())
+        self._bindings = self._configured.create_bindings()
 
         if self._model_family == "yolo26":
             # Multi-output: 6 raw conv tensors (3 box reg + 3 cls per stride). Allocate a buffer per
@@ -207,6 +218,10 @@ class HailoBackend(BaseBackend):
             (np.ndarray): ``(1, N, 6)`` float32 array of ``[x1, y1, x2, y2, conf, cls]``, descending score.
         """
         del imgsz_h, imgsz_w  # boxes are decoded in pixel space directly; predictor handles letterbox
+
+        # HailoRT emits (H, W, C) for batch=1 outputs. Add a leading batch dim if missing.
+        out_bufs = [b if b.ndim == 4 else b[None, ...] for b in out_bufs]
+
         box_ch = 4 * reg_max
         box_outs = [b for b in out_bufs if b.shape[-1] == box_ch]
         cls_outs = [c for c in out_bufs if c.shape[-1] == nc]
