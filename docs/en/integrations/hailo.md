@@ -34,9 +34,8 @@ Pass the chip name via the `name=` argument:
 | `hailo8`   | Hailo-8    | DRAM-less AI Accelerator               |
 | `hailo8l`  | Hailo-8L   | Smaller Hailo-8 variant                |
 | `hailo10h` | Hailo-10H  | **Default.** AI Accelerator            |
-| `hailo15h` | Hailo-15H  | Embedded SoC variant (high)            |
-| `hailo15m` | Hailo-15M  | Embedded SoC variant (mid)             |
-| `hailo15l` | Hailo-15L  | Embedded SoC variant (low)             |
+| `hailo15h` | Hailo-15H  | Embedded SoC (high end)                |
+| `hailo15l` | Hailo-15L  | Embedded SoC (cost effective)          |
 
 > **Note on `name=`** — Ultralytics' `name` argument also controls the run sub-directory under `runs/<task>/`. Following the same convention used by Rockchip RKNN, the Hailo export reuses it for the chip target, so a default Hailo export lands at `runs/<task>/hailo10h/`.
 

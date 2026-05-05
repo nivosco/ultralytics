@@ -13,7 +13,7 @@ from .base import BaseBackend
 
 
 class HailoBackend(BaseBackend):
-    """Hailo AI inference backend for Hailo-8/8L/10H/15H/15M/15L accelerators.
+    """Hailo AI inference backend for Hailo-8/8L/10H/15H/15L accelerators.
 
     Loads compiled Hailo models (``.hef`` files) and runs inference using HailoRT (``hailo_platform``).
 

@@ -74,7 +74,6 @@ HAILO_CHIPS = frozenset(
         "hailo8l",
         "hailo10h",
         "hailo15h",
-        "hailo15m",
         "hailo15l",
     }
 )  # Hailo chips available for export
