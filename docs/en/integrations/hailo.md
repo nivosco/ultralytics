@@ -12,8 +12,8 @@ Ultralytics supports exporting YOLO models to [Hailo](https://hailo.ai/) AI acce
 
 | Family | Detect head | NMS location | Notes |
 | :--- | :--- | :--- | :--- |
-| **YOLOv8** / **YOLO11** | Anchor-free DFL (`reg_max=16`) | On-device via `nms_postprocess(meta_arch=yolov8)` | Auto-generated NMS JSON config emitted alongside the HEF |
-| **YOLO26** (n / s / m / l) | NMS-free end2end (`reg_max=1`) | Host-side topk + gather | The Hailo NPU does not support topk/gather; postprocess runs on the host inside `HailoBackend`. The variant-specific quantization script (`yolo26{n,s,m,l}.alls`) is fetched automatically from the [Hailo Model Zoo](https://github.com/hailo-ai/hailo_model_zoo/tree/master/hailo_model_zoo/cfg/alls/generic) for accuracy parity. **YOLO26x is not supported** (no MZ-published alls); pass a custom `model_script=` to compile it. |
+| **YOLOv8** / **YOLO11** | Anchor-free DFL (`reg_max=16`) | On-device via `nms_postprocess(meta_arch=yolov8)` | The MZ-published NMS JSON for the model is fetched and patched with the export-time `conf`/`iou`/`max_det`, then compiled into the HEF. |
+| **YOLO26** (n / s / m / l) | NMS-free end2end (`reg_max=1`) | Host-side topk + gather | The Hailo NPU does not support topk/gather; postprocess runs on the host inside `HailoBackend`. The variant-specific quantization script (`yolo26{n,s,m,l}.alls`) is fetched automatically from the [Hailo Model Zoo](https://github.com/hailo-ai/hailo_model_zoo/tree/master/hailo_model_zoo/cfg/alls/generic). **YOLO26x is not supported** (no MZ-published alls); pass a custom `model_script=` to compile it. |
 
 > **Other YOLO families** (YOLOv9 / YOLOv10 / YOLOv12) are **not yet supported** — the export pipeline raises `NotImplementedError` if you attempt one. Tracked for a future release.
 
@@ -50,8 +50,10 @@ from ultralytics import YOLO
 YOLO("yolov8n.pt").export(format="hailo", data="coco8.yaml", name="hailo10h", imgsz=640)
 YOLO("yolo11n.pt").export(format="hailo", data="coco8.yaml", name="hailo10h", imgsz=640)
 
-# YOLO26 — fetches yolo26{n,s,m,l,x}.alls from the Hailo Model Zoo; postprocess runs on host.
-YOLO("yolo26s.pt").export(format="hailo", data="coco8.yaml", name="hailo10h", imgsz=640)
+# YOLO26 — fetches yolo26{n,s,m,l}.alls from the Hailo Model Zoo; postprocess runs on host.
+# YOLO26x is not supported (no MZ-published alls). data= must point at a calibration set with at
+# least 1024 images (the MZ alls hardcodes calibset_size=1024 and adaround); coco8 will fail.
+YOLO("yolo26s.pt").export(format="hailo", data="coco.yaml", name="hailo10h", imgsz=640)
 ```
 
 ### CLI
@@ -59,7 +61,8 @@ YOLO("yolo26s.pt").export(format="hailo", data="coco8.yaml", name="hailo10h", im
 ```bash
 yolo export model=yolov8n.pt format=hailo data=coco8.yaml name=hailo10h imgsz=640
 yolo export model=yolo11n.pt format=hailo data=coco8.yaml name=hailo10h imgsz=640
-yolo export model=yolo26s.pt format=hailo data=coco8.yaml name=hailo10h imgsz=640
+# YOLO26 needs ≥1024 calibration images — coco8 will fail; pass a real dataset.
+yolo export model=yolo26s.pt format=hailo data=coco.yaml  name=hailo10h imgsz=640
 ```
 
 The export produces a `<stem>_hailo_model/` directory containing `<stem>.hef` and `metadata.yaml`.
@@ -68,7 +71,7 @@ The export produces a `<stem>_hailo_model/` directory containing `<stem>.hef` an
 
 The auto-generated model script begins with `normalization([0,0,0],[255,255,255])`, meaning the chip divides input by 255 internally. **Calibration data and inference inputs must therefore be raw RGB `uint8` frames in `[0, 255]` — not pre-normalized `float [0, 1]`.** Ultralytics's standard YOLO calibration dataloader already produces uint8 frames, so the default flow should be used.
 
-For optimal quantization accuracy, supply **at least 1024 calibration images** (a warning fires below this threshold). Increase via the `fraction=` arg or pick a larger `data=` dataset.
+For optimal quantization accuracy, supply **at least 1024 calibration images** (a warning fires below this threshold). Increase via the `fraction=` arg or pick a larger `data=` dataset. The YOLOv8 / YOLO11 examples above use `coco8.yaml` for speed; for production accuracy parity (and for any YOLO26 export), use a real calibration set such as `coco.yaml` or your own training data.
 
 ### Custom model script override (advanced)
 
@@ -100,7 +103,7 @@ results = model.predict("bus.jpg")
 
 The Hailo runtime expects raw RGB `uint8` `[0, 255]` input. The standard Ultralytics predict pipeline emits a normalized float tensor; the backend silently casts it back to uint8 (matching the behavior of the Rockchip RKNN backend). `HailoBackend` reads `model_family` from the HEF directory's `metadata.yaml` and dispatches to the right decode path:
 
-- **YOLOv8 / YOLO11** — the on-device NMS emits per-class detection lists which the backend rescales to input-pixel coords.
+- **YOLOv8 / YOLO11** — the on-device NMS emits per-class detection lists which the backend rescales to input-pixel coords. The `nms_scores_th` (conf), `nms_iou_th` (iou), and `max_proposals_per_class` (max_det) values are **compiled into the HEF at export time** — runtime `predict(conf=, iou=)` overrides do not apply. Re-export with the desired thresholds to change them.
 - **YOLO26** — the chip emits 6 raw conv outputs (3 strides × {box-reg, class-logits}); the backend builds anchors per stride, applies `dist2bbox` + sigmoid, and runs a top-k selection over (anchor × class) pairs on host (the same math as `Detect.postprocess` for end2end models).
 
 Both paths return `(1, N, 6)` `[x1, y1, x2, y2, conf, cls]` in input-pixel coords and the predictor's end2end branch consumes them directly.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -11,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ultralytics.utils import LOGGER, YAML
+from ultralytics.utils import LOGGER, USER_CONFIG_DIR, YAML
 from ultralytics.utils.downloads import safe_download
 
 # --- Hailo Model Zoo resolver ------------------------------------------------------------------------
@@ -28,6 +29,8 @@ from ultralytics.utils.downloads import safe_download
 #                            it dynamically by parsing each candidate v2.x tag's docs/GETTING_STARTED.rst
 #                            for the declared DFC version. v2.18 is the first v2.x with `supported_hw_arch`
 #                            in the network YAMLs, so we refuse DFC < 3.33 for h8 / h8l.
+HAILO_DEVICES = frozenset({"hailo8", "hailo8l", "hailo10h", "hailo15h", "hailo15l"})  # Hailo devices available for export
+
 HAILO_MZ_RAW_BASE = "https://raw.githubusercontent.com/hailo-ai/hailo_model_zoo/{tag}/{path}"
 HAILO_MZ_TAGS_API = "https://api.github.com/repos/hailo-ai/hailo_model_zoo/tags?per_page=100"
 H8_DEVICES = frozenset({"hailo8", "hailo8l"})
@@ -58,10 +61,18 @@ def _resolve_model_script(model_script: str | Path | None) -> str | None:
     p = Path(s).expanduser()
     if p.is_file():
         return p.read_text()
-    # Treat as raw alls content only with a strong sentinel: multi-line, OR contains a known alls
-    # top-level call. Bare `(` is too weak — a stray path with parens would be silently shipped.
-    alls_sentinels = ("normalization", "nms_postprocess", "model_optimization_flavor", "quantization")
-    if "\n" in s or any(tok in s for tok in alls_sentinels):
+    # Path-like inputs (str | Path that look like a filesystem path) must resolve to a real file —
+    # otherwise we'd silently misread `/data/normalization_calib/foo.alls` as raw alls content
+    # because `normalization` appears in the path.
+    if isinstance(model_script, Path) or (Path(s).suffix and "\n" not in s):
+        raise FileNotFoundError(
+            f"model_script={model_script!r} looks like a path but does not exist."
+        )
+    # Treat as raw alls content only with a strong sentinel: multi-line, OR a top-level alls call
+    # with its `(` (so `normalization(...)`, `nms_postprocess(...)` etc. match but a bare path
+    # containing one of those words does not).
+    sentinel_call_re = re.compile(r"\b(normalization|nms_postprocess|model_optimization_flavor|quantization)\s*\(")
+    if "\n" in s or sentinel_call_re.search(s):
         return s
     raise FileNotFoundError(
         f"model_script={model_script!r} is not a file and does not look like alls content. "
@@ -180,7 +191,7 @@ def _h8_dfc_to_mz_tag(dfc_version: tuple[int, int, int]) -> str:
 
 def _h8_index_path() -> Path:
     """Disk location for the cached H8 DFC↔MZ index."""
-    return Path.home() / ".cache" / "ultralytics" / "hailo_mz_index.json"
+    return USER_CONFIG_DIR / "hailo_mz_index.json"
 
 
 def _load_h8_index() -> dict:
@@ -205,12 +216,34 @@ def _save_h8_index(index: dict) -> None:
 
 
 def _fetch_text(url: str, timeout: float = 15.0) -> str | None:
-    """GET a URL with urllib and return the response body as text. None on any failure."""
+    """GET a URL with urllib and return the response body as text. None on any failure.
+
+    For api.github.com URLs, an Authorization header is added when ``GITHUB_TOKEN`` or ``GH_TOKEN`` is
+    set, raising the unauthenticated 60 req/hr quota to 5000 req/hr. 403 rate-limit responses are
+    logged at WARNING (with the reset timestamp if the API returns one) so users know to retry later
+    or set a token.
+    """
+    headers = {"User-Agent": "ultralytics-hailo-resolver"}
+    if "api.github.com" in url:
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "ultralytics-hailo-resolver"})
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+    except urllib.error.HTTPError as e:
+        if e.code == 403 and "api.github.com" in url:
+            reset = e.headers.get("X-RateLimit-Reset") if e.headers else None
+            hint = f" (rate limit resets at unix={reset})" if reset else ""
+            LOGGER.warning(
+                f"Hailo: GitHub API rate-limited at {url}{hint}. Set GITHUB_TOKEN to raise the quota "
+                f"to 5000 req/hr, or pass model_script= to bypass the MZ resolver."
+            )
+        else:
+            LOGGER.debug(f"Hailo: GET {url} failed: HTTPError {e.code}: {e}")
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
         LOGGER.debug(f"Hailo: GET {url} failed: {type(e).__name__}: {e}")
         return None
 
@@ -393,6 +426,10 @@ def _fetch_and_patch_nms_config(
     config = json.loads(json_path.read_text())
     config["nms_scores_th"] = float(conf)
     config["nms_iou_th"] = float(iou)
+    # Hailo's max_proposals_per_class is a per-class on-device cap, while Ultralytics' max_det is a
+    # total cap. Mirroring max_det here keeps the chip permissive (up to nc * max_det proposals);
+    # HailoBackend._decode_nms then sorts and trims to max_det total. A tighter per-class cap would
+    # save NPU bandwidth but could starve a dominant class on class-imbalanced frames.
     config["max_proposals_per_class"] = int(max_det)
     json_path.write_text(json.dumps(config, indent=2))
     new_ref = f'{match.group(1)}{json_path.resolve()}{match.group(3)}'
@@ -438,7 +475,6 @@ def onnx2hailo(
     metadata: dict | None = None,
     model_name: str = "model",
     model_family: str = "yolov8",
-    scale: str = "",
     end_node_names: list[str] | None = None,
     prefix: str = "",
 ) -> str:
@@ -480,8 +516,6 @@ def onnx2hailo(
             both the network YAML and the alls.
         model_family (str): ``"yolov8"`` (default) or ``"yolo26"``. Controls whether the on-device NMS
             JSON is fetched + patched (yolov8/yolo11) or skipped (yolo26).
-        scale (str): Model scale letter — only used to populate yolo26 metadata; MZ filenames are
-            keyed off ``model_name``, not ``scale``.
         end_node_names (list[str] | None): ONNX end-node names to cut the graph at. The caller computes
             these because the conv-leaf prefix is family-specific (``cv2``/``cv3`` for yolov8,
             ``one2one_cv2``/``one2one_cv3`` for yolo26).
@@ -538,6 +572,8 @@ def onnx2hailo(
 
     alls_text: str | None = _resolve_model_script(model_script)
     mz_tag: str | None = None
+    # MZ-resolver scratch files — deleted after compile so the output dir only ships the HEF + metadata.
+    mz_artifacts: list[Path] = []
 
     if alls_text is None:
         if task != "detect":
@@ -564,13 +600,16 @@ def onnx2hailo(
                 f"{model_name!r} is not published in Hailo Model Zoo at {mz_tag}; pass model_script= "
                 f"to compile a custom variant."
             )
+        mz_artifacts.append(yaml_path)
         _validate_hw_support(yaml_path, model_name, hw_arch)
         alls_path = _resolve_mz_alls(model_name, mz_tag, hw_arch, output_dir)
+        mz_artifacts.append(alls_path)
         if model_family != "yolo26":
-            _fetch_and_patch_nms_config(
+            json_path = _fetch_and_patch_nms_config(
                 alls_path, model_name, mz_tag, output_dir,
                 conf=conf, iou=iou, max_det=max_det,
             )
+            mz_artifacts.append(json_path)
         alls_text = alls_path.read_text()
 
     runner.load_model_script(alls_text)
@@ -579,6 +618,15 @@ def onnx2hailo(
     hef_bytes = runner.compile()
     hef_path = output_dir / f"{model_name}.hef"
     hef_path.write_bytes(hef_bytes)
+
+    # Resolver scratch files (network YAML + alls + NMS JSON) are no longer needed — the HEF holds the
+    # compiled graph and the JSON's thresholds are baked in. Leaving them around (especially the alls,
+    # which we rewrote with an absolute local path) leaks host paths if the user tarballs the dir.
+    for artifact in mz_artifacts:
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            LOGGER.debug(f"Hailo: could not unlink scratch artifact {artifact}: {cleanup_error}")
 
     if metadata is not None:
         # Family-specific params HailoBackend needs at load time. yolov8's on-device NMS path doesn't need
@@ -633,8 +681,20 @@ def _yolo26_head_outputs(runner, end_node_names: list[str]) -> dict:
                 f"head_outputs metadata will be omitted (runtime falls back to channel-count dispatch)."
             )
             return {}
+        # Sort each role by spatial dim (largest -> smallest = stride[0] -> stride[-1]). Layers are
+        # NHWC in HN today, so dim 1 is the H spatial. Validate the rank + that the value isn't the
+        # channel count (4 for box, nc for cls) so a future SDK that reports NCHW or scalar shapes
+        # fails loud instead of silently scrambling stride order.
         box_layers = output_preds[0::2]
         cls_layers = output_preds[1::2]
+        for layer in (*box_layers, *cls_layers):
+            shape = layer.output_shapes[0]
+            if len(shape) != 4:
+                LOGGER.warning(
+                    f"Hailo: HN layer {layer.name!r} has unexpected rank {len(shape)} (shape={shape}); "
+                    f"head_outputs metadata omitted (runtime falls back to channel-count dispatch)."
+                )
+                return {}
         box_layers.sort(key=lambda layer: -layer.output_shapes[0][1])
         cls_layers.sort(key=lambda layer: -layer.output_shapes[0][1])
         return {

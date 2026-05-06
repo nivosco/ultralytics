@@ -87,7 +87,6 @@ from ultralytics.nn.tasks import ClassificationModel, DetectionModel, Segmentati
 from ultralytics.utils import (
     ARM64,
     DEFAULT_CFG,
-    HAILO_DEVICES,
     IS_DOCKER,
     LINUX,
     LOGGER,
@@ -334,45 +333,34 @@ class Exporter:
                     "IMX export only supported for detection, pose estimation, classification, and segmentation models."
                 )
         if fmt == "hailo":
+            from ultralytics.utils.export.hailo import HAILO_DEVICES
+
             if not LINUX:
                 raise NotImplementedError("Hailo export is only supported on Linux.")
             if model.task != "detect":
                 raise ValueError(
                     f"Hailo export currently only supports the 'detect' task, got task='{model.task}'."
                 )
-            # Restrict to families with a known DFC + decode path: YOLOv8 / YOLO11 (on-device NMS) and
-            # YOLO26 (host-side end2end postprocess). Other YOLO families (v9/v10/v12) aren't validated.
-            import re as _re
-
-            model_path = (
-                getattr(model, "pt_path", None)
-                or getattr(model, "yaml_file", None)
-                or (model.yaml.get("yaml_file", "") if hasattr(model, "yaml") else "")
-            )
-            stem = Path(str(model_path)).stem.lower() if model_path else ""
-            family_match = _re.match(r"^yolov?(\d+)", stem)
-            family = family_match.group(1) if family_match else None
-            if family not in {"8", "11", "26"}:
-                raise NotImplementedError(
-                    f"Hailo export currently supports YOLOv8, YOLO11, and YOLO26 detect models only "
-                    f"(model='{stem or '?'}' indicates family {family or 'unknown'})."
-                )
+            # Family dispatch happens via detect-head introspection in export_hailo (end2end + reg_max).
+            # No filename regex — that breaks for renamed checkpoints and silently drops models from any
+            # YOLO variant that pairs the standard Detect head with the supported reg_max values.
             if not self.args.int8:
-                LOGGER.warning("Setting int8=True for Hailo quantization.")
-                self.args.int8 = True
+                raise ValueError(
+                    "Hailo export requires int8=True (the DFC compiles a quantized HEF; "
+                    "float export is not supported). Re-run with int8=True."
+                )
             if not self.args.data:
                 self.args.data = TASK2CALIBRATIONDATA.get(model.task)
             if not self.args.name:
-                LOGGER.warning(
-                    "Hailo export requires a missing 'name' arg for chip target. Using default name='hailo10h'."
+                raise ValueError(
+                    f"Hailo export requires name=<chip target>, one of {sorted(HAILO_DEVICES)}. "
+                    f"Example: format='hailo', name='hailo10h'. (Note: 'name=' is overloaded with the "
+                    f"run sub-directory; use 'project=' to control runs/<task>/<dir>.)"
                 )
-                self.args.name = "hailo10h"
             self.args.name = self.args.name.lower()
             if self.args.name not in HAILO_DEVICES:
                 raise ValueError(
-                    f"Invalid Hailo device '{self.args.name}'. Valid names are {sorted(HAILO_DEVICES)}. "
-                    f"Note: 'name=' is overloaded for the device target (mirrors RKNN). To control the "
-                    f"run sub-directory under runs/<task>/, use 'project=' instead."
+                    f"Invalid Hailo device '{self.args.name}'. Valid names are {sorted(HAILO_DEVICES)}."
                 )
         if not hasattr(model, "names"):
             model.names = default_class_names()
@@ -1030,7 +1018,6 @@ class Exporter:
     @try_export
     def export_hailo(self, prefix=colorstr("Hailo:")):
         """Export YOLO model to Hailo HEF format via the Hailo Dataflow Compiler."""
-        from ultralytics.nn.tasks import guess_model_scale
         from ultralytics.utils.export.hailo import _dataloader_to_numpy, onnx2hailo
 
         self.args.opset = min(self.args.opset or 17, 17)  # Hailo DFC opset cap
@@ -1055,13 +1042,8 @@ class Exporter:
         is_end2end_dfl_free = bool(getattr(detect_head, "end2end", False)) and getattr(detect_head, "reg_max", 16) == 1
         model_family = "yolo26" if is_end2end_dfl_free else "yolov8"
         if is_end2end_dfl_free:
-            # scale is recorded in metadata for the host-side YOLO26 decode; MZ filenames are keyed
-            # off the file stem (e.g. yolo26m.alls), so per-scale support is gated by the MZ network
-            # YAML's supported_hw_arch (validated in onnx2hailo) — no hardcoded allowlist here.
-            scale = guess_model_scale(self.file.stem) or guess_model_scale(self.model.ckpt_path or "") or ""
             cv2_prefix, cv3_prefix = "one2one_cv2", "one2one_cv3"
         else:
-            scale = ""
             cv2_prefix, cv3_prefix = "cv2", "cv3"
         end_node_names = [
             name
@@ -1087,7 +1069,6 @@ class Exporter:
             metadata=self.metadata,
             model_name=self.file.stem,
             model_family=model_family,
-            scale=scale,
             end_node_names=end_node_names,
             prefix=prefix,
         )
