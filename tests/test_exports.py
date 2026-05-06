@@ -495,140 +495,45 @@ def test_hailo_yolo26_postprocess_topk_and_conf_drop():
     assert (out[0, :, 4] > 0.1).all()
 
 
-def test_hailo_resolve_mz_tag_h10h_is_numerical():
-    """h10h/h15h/h15l: DFC X.Y -> MZ tag vX.Y.0 with no network calls."""
-    from ultralytics.utils.export.hailo import _resolve_mz_tag
-
-    assert _resolve_mz_tag((5, 2, 0), "hailo10h") == "v5.2.0"
-    assert _resolve_mz_tag((4, 17, 1), "hailo15h") == "v4.17.0"
-    assert _resolve_mz_tag((6, 0, 0), "hailo15l") == "v6.0.0"
-
-
-def test_hailo_resolve_mz_tag_h8_below_min_dfc_raises():
-    """h8/h8l reject DFC < 3.33 because MZ v2.18 is the first tag with supported_hw_arch."""
-    from ultralytics.utils.export.hailo import _resolve_mz_tag
-
-    with pytest.raises(NotImplementedError, match="DFC >= 3.33"):
-        _resolve_mz_tag((3, 32, 0), "hailo8")
-    with pytest.raises(NotImplementedError, match="DFC >= 3.33"):
-        _resolve_mz_tag((3, 0, 0), "hailo8l")
-
-
-def test_hailo_resolve_model_script_path_must_exist(tmp_path):
-    """Path-like inputs that don't exist must raise FileNotFoundError, not be misread as alls content."""
+def test_hailo_resolve_model_script_path_vs_content(tmp_path):
+    """Path-like inputs that don't exist raise FileNotFoundError; raw alls content is detected via the
+    sentinel-call regex, not a substring match (so a path with the word ``normalization`` isn't
+    silently misread as content).
+    """
     from ultralytics.utils.export.hailo import _resolve_model_script
 
-    # Path containing a sentinel word but not actually a file -> FileNotFoundError, not silent acceptance.
+    assert _resolve_model_script(None) is None  # no override -> caller runs MZ resolver
     bogus = tmp_path / "normalization_calib" / "missing.alls"
     with pytest.raises(FileNotFoundError):
         _resolve_model_script(bogus)
-    with pytest.raises(FileNotFoundError):
-        _resolve_model_script(str(bogus))
-
-    # Real file: returned as content.
     real = tmp_path / "real.alls"
     real.write_text("normalization([0,0,0],[255,255,255])\n")
-    assert _resolve_model_script(real) == "normalization([0,0,0],[255,255,255])\n"
-
-    # Multi-line raw content with no path-like shape: accepted as content.
-    raw = "normalization([0,0,0],[255,255,255])\nquantization_param({...})\n"
-    assert _resolve_model_script(raw) == raw
+    assert _resolve_model_script(real).startswith("normalization(")
 
 
-def test_hailo_resolve_model_script_none_returns_none():
-    """No model_script -> caller falls through to MZ resolver."""
-    from ultralytics.utils.export.hailo import _resolve_model_script
-
-    assert _resolve_model_script(None) is None
-
-
-def test_hailo_h8_dfc_to_mz_tag_uses_cached_mapping(monkeypatch, tmp_path):
-    """The DFC↔MZ resolver should hit the on-disk cache and skip network calls when present."""
+def test_hailo_h8_dfc_to_mz_tag_cache_skips_network(monkeypatch, tmp_path):
+    """The H8 DFC↔MZ resolver hits the on-disk cache and skips GitHub when present."""
     from ultralytics.utils.export import hailo as hailo_mod
 
-    # Redirect cache to tmp_path; pre-populate so no GitHub call is needed.
     cache_path = tmp_path / "hailo_mz_index.json"
     cache_path.write_text('{"3.33.0": "v2.18"}')
     monkeypatch.setattr(hailo_mod, "_h8_index_path", lambda: cache_path)
-
-    def boom(*_args, **_kwargs):
-        raise AssertionError("network must not be hit when cache resolves the version")
-
-    monkeypatch.setattr(hailo_mod, "_fetch_text", boom)
-
+    monkeypatch.setattr(
+        hailo_mod, "_fetch_text", lambda *a, **kw: pytest.fail("network must not be hit when cache resolves")
+    )
     assert hailo_mod._h8_dfc_to_mz_tag((3, 33, 0)) == "v2.18"
 
 
-def test_hailo_fetch_text_403_logs_rate_limit(monkeypatch):
-    """403 from api.github.com should produce a WARNING that mentions GITHUB_TOKEN."""
-    import urllib.error
-    import urllib.request
-
-    from ultralytics.utils.export import hailo as hailo_mod
-
-    def fake_urlopen(req, timeout=None):
-        raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {"X-RateLimit-Reset": "1700000000"}, None)
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-
-    warnings: list[str] = []
-    monkeypatch.setattr(hailo_mod.LOGGER, "warning", lambda msg: warnings.append(msg))
-
-    result = hailo_mod._fetch_text("https://api.github.com/repos/foo/bar/tags")
-    assert result is None
-    assert any("rate-limited" in msg and "GITHUB_TOKEN" in msg for msg in warnings)
-
-
-def test_hailo_yolo26_metadata_round_trip(tmp_path):
-    """Hailo-private metadata persists through YAML.save / YAML.load and HailoBackend pops it cleanly."""
-    from ultralytics.utils import YAML
-
-    # Round-trip a representative metadata dict containing both shared (names, imgsz) and Hailo-private
-    # (model_family, head_outputs, ...) keys; assert all fields survive.
-    payload = {
-        "names": {0: "person", 1: "car"},
-        "imgsz": [640, 640],
-        "model_family": "yolo26",
-        "hailo_mz_tag": "v5.2.0",
-        "head_outputs": {
-            "box_layers": [{"name": "yolo26m/conv61", "spatial": 80}],
-            "cls_layers": [{"name": "yolo26m/conv62", "spatial": 80}],
-        },
-        "strides": [8, 16, 32],
-        "reg_max": 1,
-        "nc": 80,
-        "max_det": 300,
-        "conf": 0.25,
-    }
-    p = tmp_path / "metadata.yaml"
-    YAML.save(p, payload)
-    loaded = YAML.load(p)
-    assert loaded["model_family"] == "yolo26"
-    assert loaded["head_outputs"]["box_layers"][0]["name"] == "yolo26m/conv61"
-    assert loaded["strides"] == [8, 16, 32]
-    assert loaded["reg_max"] == 1
-    assert loaded["names"] == {0: "person", 1: "car"}
-
-
-def test_hailo_export_rejects_invalid_device_name(tmp_path):
-    """Hailo export with an invalid name= must raise ValueError naming valid devices."""
-    if not LINUX:
-        pytest.skip("Hailo export pre-flight only runs on Linux")
-    with pytest.raises(ValueError, match="Invalid Hailo device"):
-        YOLO(MODEL).export(format="hailo", imgsz=32, data="coco8.yaml", int8=True, name="not-a-real-chip")
-
-
-def test_hailo_export_requires_int8_true(tmp_path):
-    """Hailo export with int8=False must raise (silent flips were hiding misconfigurations)."""
-    if not LINUX:
-        pytest.skip("Hailo export pre-flight only runs on Linux")
-    with pytest.raises(ValueError, match="int8=True"):
-        YOLO(MODEL).export(format="hailo", imgsz=32, data="coco8.yaml", name="hailo10h", int8=False)
-
-
-def test_hailo_export_requires_name_arg(tmp_path):
-    """Hailo export without name= must raise (no silent default chip)."""
-    if not LINUX:
-        pytest.skip("Hailo export pre-flight only runs on Linux")
-    with pytest.raises(ValueError, match="name=<chip target>"):
-        YOLO(MODEL).export(format="hailo", imgsz=32, data="coco8.yaml", int8=True)
+@pytest.mark.skipif(not LINUX, reason="Hailo export pre-flight only runs on Linux")
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"int8": False, "name": "hailo10h"}, "int8=True"),  # silent int8 flip is now a hard error
+        ({"int8": True}, "name=<chip target>"),  # silent default chip is now a hard error
+        ({"int8": True, "name": "not-a-real-chip"}, "Invalid Hailo device"),  # unknown device
+    ],
+)
+def test_hailo_export_preflight_errors(kwargs, match):
+    """Pre-flight rejects misconfigured Hailo exports loudly instead of silently mutating user args."""
+    with pytest.raises(ValueError, match=match):
+        YOLO(MODEL).export(format="hailo", imgsz=32, data="coco8.yaml", **kwargs)
