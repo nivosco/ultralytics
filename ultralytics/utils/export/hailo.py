@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from ultralytics.utils import LOGGER, USER_CONFIG_DIR, YAML
+from ultralytics.utils import LOGGER, YAML
 from ultralytics.utils.downloads import safe_download
 
 # --- Hailo Model Zoo resolver ------------------------------------------------------------------------
@@ -25,18 +22,20 @@ from ultralytics.utils.downloads import safe_download
 #
 # DFC ↔ MZ tag mapping
 #   • Hailo10H / 15H / 15L: DFC X.Y → MZ tag vX.Y.0 (numerically aligned).
-#   • Hailo8 / 8L         : MZ v2.x line; mapping is not numerical (e.g. v2.18 ↔ DFC 3.33). We resolve
-#                            it dynamically by parsing each candidate v2.x tag's docs/GETTING_STARTED.rst
-#                            for the declared DFC version. v2.18 is the first v2.x with `supported_hw_arch`
-#                            in the network YAMLs, so we refuse DFC < 3.33 for h8 / h8l.
+#   • Hailo8 / 8L         : MZ v2.x line is not numerically aligned with DFC versions. The mapping is
+#                            maintained by hand in ``H8_DFC_TO_MZ_TAG`` below — refresh on each Hailo
+#                            DFC release. v2.18 is the first v2.x release with ``supported_hw_arch``.
 HAILO_DEVICES = frozenset({"hailo8", "hailo8l", "hailo10h", "hailo15h", "hailo15l"})  # Hailo devices available for export
+H8_DEVICES = frozenset({"hailo8", "hailo8l"})
+
+# DFC (major, minor) → Model Zoo git tag for the v2.x line (Hailo8 / Hailo8L). The h8 line stalled at
+# MZ v2.x while h10h+ moved to v4+, so the mapping is per-release. Append a row when Hailo publishes a
+# new DFC v3.x; users on a DFC version not in this table are asked to pass ``model_script=`` directly.
+H8_DFC_TO_MZ_TAG: dict[tuple[int, int], str] = {
+    (3, 33): "v2.18",
+}
 
 HAILO_MZ_RAW_BASE = "https://raw.githubusercontent.com/hailo-ai/hailo_model_zoo/{tag}/{path}"
-HAILO_MZ_TAGS_API = "https://api.github.com/repos/hailo-ai/hailo_model_zoo/tags?per_page=100"
-H8_DEVICES = frozenset({"hailo8", "hailo8l"})
-H8_MIN_DFC_VERSION = (3, 33)
-H8_MIN_MZ_TAG = "v2.18"
-DFC_VERSION_RE = re.compile(r"Hailo\s+Dataflow\s+Compiler\s+v?(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
 NMS_POSTPROCESS_RE = re.compile(r'(nms_postprocess\(\s*")([^"]+\.json)(")', re.IGNORECASE)
 
 
@@ -116,163 +115,22 @@ def _resolve_dfc_version() -> tuple[int, int, int]:
 def _resolve_mz_tag(dfc_version: tuple[int, int, int], hw_arch: str) -> str:
     """Map a DFC version + target device to the Hailo Model Zoo git tag.
 
-    Args:
-        dfc_version (tuple[int, int, int]): ``(major, minor, patch)``.
-        hw_arch (str): Hailo device name (matches MZ folder name).
-
-    Returns:
-        (str): MZ git tag (e.g. ``"v5.2.0"`` for h10h/h15h/h15l, ``"v2.18"`` for h8/h8l).
+    h10h/h15h/h15l: numerical (``DFC X.Y → vX.Y.0``). h8/h8l: hand-maintained table since the v2.x
+    line isn't numerically aligned with DFC.
 
     Raises:
-        NotImplementedError: For h8/h8l with DFC below ``H8_MIN_DFC_VERSION``.
+        NotImplementedError: For h8/h8l DFC versions not in ``H8_DFC_TO_MZ_TAG``.
     """
     if hw_arch in H8_DEVICES:
-        if dfc_version < H8_MIN_DFC_VERSION:
+        key = (dfc_version[0], dfc_version[1])
+        if key not in H8_DFC_TO_MZ_TAG:
             raise NotImplementedError(
-                f"Hailo8/8L export needs DFC >= {H8_MIN_DFC_VERSION[0]}.{H8_MIN_DFC_VERSION[1]} "
-                f"(MZ {H8_MIN_MZ_TAG} is the first v2.x release with supported_hw_arch metadata). "
-                f"Installed DFC: {dfc_version[0]}.{dfc_version[1]}.{dfc_version[2]}. Upgrade DFC, or pass "
-                f"model_script= to bypass the MZ resolver."
+                f"No Hailo Model Zoo tag mapped for Hailo8/8L on DFC {key[0]}.{key[1]}. Known mappings: "
+                f"{sorted(H8_DFC_TO_MZ_TAG)}. Upgrade Ultralytics, or pass model_script= to bypass the "
+                f"MZ resolver and supply a custom alls."
             )
-        return _h8_dfc_to_mz_tag(dfc_version)
+        return H8_DFC_TO_MZ_TAG[key]
     return f"v{dfc_version[0]}.{dfc_version[1]}.0"
-
-
-def _h8_dfc_to_mz_tag(dfc_version: tuple[int, int, int]) -> str:
-    """Resolve the Hailo Model Zoo v2.x tag for a Hailo8 / Hailo8L DFC version.
-
-    The DFC ↔ MZ mapping for the v2.x line is documented per-tag in
-    ``docs/GETTING_STARTED.rst``. We parse each candidate tag's doc and cache the result on disk so
-    subsequent exports don't re-fetch.
-
-    Args:
-        dfc_version (tuple[int, int, int]): ``(major, minor, patch)``.
-
-    Returns:
-        (str): Matching MZ git tag (e.g. ``"v2.18"``).
-
-    Raises:
-        RuntimeError: If the GitHub tags API or doc fetches fail, or no v2.x tag declares the
-            installed DFC version.
-    """
-    cache = _load_h8_index()
-    key = ".".join(str(p) for p in dfc_version)
-    cached = cache.get(key)
-    if cached:
-        return cached
-
-    candidate_tags = _list_mz_v2_tags()
-    if not candidate_tags:
-        raise RuntimeError(
-            "Failed to list Hailo Model Zoo v2.x tags from the GitHub API; cannot resolve the DFC "
-            "<-> MZ mapping for Hailo8/8L. Check connectivity to api.github.com or pass model_script=."
-        )
-
-    tried: list[str] = []
-    for tag in candidate_tags:
-        rst = _fetch_text(HAILO_MZ_RAW_BASE.format(tag=tag, path="docs/GETTING_STARTED.rst"))
-        tried.append(tag)
-        if rst is None:
-            continue
-        match = DFC_VERSION_RE.search(rst)
-        if not match:
-            continue
-        ver = (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
-        cache[".".join(str(p) for p in ver)] = tag
-        if ver == dfc_version:
-            _save_h8_index(cache)
-            return tag
-    _save_h8_index(cache)
-    raise RuntimeError(
-        f"No Hailo Model Zoo v2.x tag declares DFC {key}. Tags inspected: {tried}. Upgrade DFC, or pass "
-        f"model_script= to bypass the MZ resolver."
-    )
-
-
-def _h8_index_path() -> Path:
-    """Disk location for the cached H8 DFC↔MZ index."""
-    return USER_CONFIG_DIR / "hailo_mz_index.json"
-
-
-def _load_h8_index() -> dict:
-    """Load the cached H8 DFC↔MZ index, or an empty dict if absent / corrupt."""
-    p = _h8_index_path()
-    if not p.is_file():
-        return {}
-    try:
-        return json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save_h8_index(index: dict) -> None:
-    """Persist the H8 DFC↔MZ index. Best-effort — failures are logged but non-fatal."""
-    p = _h8_index_path()
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(index, indent=2, sort_keys=True))
-    except OSError as e:
-        LOGGER.warning(f"Hailo: could not write MZ index cache at {p}: {e}")
-
-
-def _fetch_text(url: str, timeout: float = 15.0) -> str | None:
-    """GET a URL with urllib and return the response body as text. None on any failure.
-
-    For api.github.com URLs, an Authorization header is added when ``GITHUB_TOKEN`` or ``GH_TOKEN`` is
-    set, raising the unauthenticated 60 req/hr quota to 5000 req/hr. 403 rate-limit responses are
-    logged at WARNING (with the reset timestamp if the API returns one) so users know to retry later
-    or set a token.
-    """
-    headers = {"User-Agent": "ultralytics-hailo-resolver"}
-    if "api.github.com" in url:
-        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        if e.code == 403 and "api.github.com" in url:
-            reset = e.headers.get("X-RateLimit-Reset") if e.headers else None
-            hint = f" (rate limit resets at unix={reset})" if reset else ""
-            LOGGER.warning(
-                f"Hailo: GitHub API rate-limited at {url}{hint}. Set GITHUB_TOKEN to raise the quota "
-                f"to 5000 req/hr, or pass model_script= to bypass the MZ resolver."
-            )
-        else:
-            LOGGER.debug(f"Hailo: GET {url} failed: HTTPError {e.code}: {e}")
-        return None
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        LOGGER.debug(f"Hailo: GET {url} failed: {type(e).__name__}: {e}")
-        return None
-
-
-def _list_mz_v2_tags() -> list[str]:
-    """List Hailo Model Zoo v2.x git tags >= ``H8_MIN_MZ_TAG``, sorted descending (newest first).
-
-    Hits the unauthenticated GitHub API; rate limit ~60 req/hour is plenty for occasional exports.
-    """
-    body = _fetch_text(HAILO_MZ_TAGS_API)
-    if body is None:
-        return []
-    try:
-        tags = [item["name"] for item in json.loads(body) if isinstance(item, dict) and "name" in item]
-    except json.JSONDecodeError:
-        return []
-    pattern = re.compile(r"^v(2)\.(\d+)(?:\.(\d+))?$")
-    candidates: list[tuple[tuple[int, int, int], str]] = []
-    min_minor = int(H8_MIN_MZ_TAG.split(".")[1])
-    for tag in tags:
-        match = pattern.match(tag)
-        if not match:
-            continue
-        version = (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
-        if version[1] < min_minor:
-            continue
-        candidates.append((version, tag))
-    candidates.sort(reverse=True)
-    return [tag for _, tag in candidates]
 
 
 def _fetch_mz_file(
@@ -574,6 +432,15 @@ def onnx2hailo(
     mz_tag: str | None = None
     # MZ-resolver scratch files — deleted after compile so the output dir only ships the HEF + metadata.
     mz_artifacts: list[Path] = []
+
+    if alls_text is not None:
+        # User-supplied alls bypasses MZ resolution — including the hw_arch compatibility check we'd
+        # otherwise do via the network YAML's supported_hw_arch list. Surface that so the user knows
+        # they own the alls↔device match.
+        LOGGER.warning(
+            f"{prefix} model_script= override skips hw_arch validation against the Hailo Model Zoo. "
+            f"Ensure the alls is tuned for hw_arch={hw_arch!r}; a mismatch will compile a misconfigured HEF."
+        )
 
     if alls_text is None:
         if task != "detect":
