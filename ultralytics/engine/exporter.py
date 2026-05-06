@@ -87,7 +87,7 @@ from ultralytics.nn.tasks import ClassificationModel, DetectionModel, Segmentati
 from ultralytics.utils import (
     ARM64,
     DEFAULT_CFG,
-    HAILO_CHIPS,
+    HAILO_DEVICES,
     IS_DOCKER,
     LINUX,
     LOGGER,
@@ -334,12 +334,13 @@ class Exporter:
                     "IMX export only supported for detection, pose estimation, classification, and segmentation models."
                 )
         if fmt == "hailo":
-            assert LINUX, "Hailo export is only supported on Linux."
+            if not LINUX:
+                raise NotImplementedError("Hailo export is only supported on Linux.")
             if model.task != "detect":
                 raise ValueError(
                     f"Hailo export currently only supports the 'detect' task, got task='{model.task}'."
                 )
-            # Restrict to families with a known DFC + decode path: YOLOv8 / YOLO11 (on-chip NMS) and
+            # Restrict to families with a known DFC + decode path: YOLOv8 / YOLO11 (on-device NMS) and
             # YOLO26 (host-side end2end postprocess). Other YOLO families (v9/v10/v12) aren't validated.
             import re as _re
 
@@ -367,9 +368,12 @@ class Exporter:
                 )
                 self.args.name = "hailo10h"
             self.args.name = self.args.name.lower()
-            assert self.args.name in HAILO_CHIPS, (
-                f"Invalid chip name '{self.args.name}' for Hailo export. Valid names are {sorted(HAILO_CHIPS)}."
-            )
+            if self.args.name not in HAILO_DEVICES:
+                raise ValueError(
+                    f"Invalid Hailo device '{self.args.name}'. Valid names are {sorted(HAILO_DEVICES)}. "
+                    f"Note: 'name=' is overloaded for the device target (mirrors RKNN). To control the "
+                    f"run sub-directory under runs/<task>/, use 'project=' instead."
+                )
         if not hasattr(model, "names"):
             model.names = default_class_names()
         model.names = check_class_names(model.names)
@@ -1029,11 +1033,8 @@ class Exporter:
         from ultralytics.nn.tasks import guess_model_scale
         from ultralytics.utils.export.hailo import _dataloader_to_numpy, onnx2hailo
 
-        prev_opset, self.args.opset = self.args.opset, min(self.args.opset or 17, 17)  # Hailo DFC opset cap
-        try:
-            f_onnx = self.export_onnx()
-        finally:
-            self.args.opset = prev_opset
+        self.args.opset = min(self.args.opset or 17, 17)  # Hailo DFC opset cap
+        f_onnx = self.export_onnx()
         calibration = _dataloader_to_numpy(self.get_int8_calibration_dataloader(prefix))
 
         # HailoBackend emits (1, N, 6) end2end predictions for both supported families, so advertise
@@ -1043,29 +1044,21 @@ class Exporter:
         # Cut the ONNX at the Detect head's conv leaves so the parser doesn't try to compile the DFL /
         # dist2bbox / topk subgraph (NPU doesn't support topk/gather; PT version-specific shape ops in
         # decode also break the parser). The 6 leaves vary by family:
-        #   yolov8/yolo11: cv2.{i}.2/Conv (4*reg_max ch), cv3.{i}.2/Conv (nc ch) — on-chip NMS attaches
+        #   yolov8/yolo11: cv2.{i}.2/Conv (4*reg_max ch), cv3.{i}.2/Conv (nc ch) — on-device NMS attaches
         #   yolo26       : one2one_cv2.{i}.2/Conv (4 ch), one2one_cv3.{i}.2/Conv (nc ch) — host postprocess
-        head_module_name = ".".join(list(self.model.named_modules())[-1][0].split(".")[:2])
         detect_head = self.model.model[-1]
-        # YOLO26 = end2end head + reg_max=1 (DFL is Identity → direct l/t/r/b distance regression).
+        head_module_name = f"model.{len(self.model.model) - 1}"
         # The end2end *property* on Detect falls back to True if `_end2end` is unset and `one2one_cv2`
         # exists (end2end yaml flag triggers one2one_cv2 creation in __init__), so it's the reliable check.
-        is_yolo26 = bool(getattr(detect_head, "end2end", False)) and getattr(detect_head, "reg_max", 16) == 1
-        model_family = "yolo26" if is_yolo26 else "yolov8"
-        if is_yolo26:
-            scale = guess_model_scale(self.file.stem) or guess_model_scale(self.model.ckpt_path or "")
-            if not scale:
-                raise NotImplementedError(
-                    f"Could not infer YOLO26 scale (n/s/m/l) from {self.file.stem!r}. "
-                    f"Pass a custom alls via model_script= for non-standard variants."
-                )
-            # Hailo Model Zoo publishes alls for n/s/m/l only — yolo26x has no MZ-tuned quantization
-            # script yet, so refuse rather than silently 404 in safe_download.
-            if scale not in {"n", "s", "m", "l"}:
-                raise NotImplementedError(
-                    f"YOLO26 scale {scale!r} is not supported by the Hailo Model Zoo (only n/s/m/l have "
-                    f"published alls files). Pass a custom alls via model_script= to compile yolo26{scale}."
-                )
+        # We dispatch by "end2end + DFL-free" rather than a class check so any future end2end+reg_max=1
+        # head reuses this path automatically; rename guards against silently inheriting the YOLO26 branch.
+        is_end2end_dfl_free = bool(getattr(detect_head, "end2end", False)) and getattr(detect_head, "reg_max", 16) == 1
+        model_family = "yolo26" if is_end2end_dfl_free else "yolov8"
+        if is_end2end_dfl_free:
+            # scale is recorded in metadata for the host-side YOLO26 decode; MZ filenames are keyed
+            # off the file stem (e.g. yolo26m.alls), so per-scale support is gated by the MZ network
+            # YAML's supported_hw_arch (validated in onnx2hailo) — no hardcoded allowlist here.
+            scale = guess_model_scale(self.file.stem) or guess_model_scale(self.model.ckpt_path or "") or ""
             cv2_prefix, cv3_prefix = "one2one_cv2", "one2one_cv3"
         else:
             scale = ""

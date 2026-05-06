@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -11,139 +14,396 @@ import torch
 from ultralytics.utils import LOGGER, YAML
 from ultralytics.utils.downloads import safe_download
 
-# Hailo Model Zoo URL pattern for the YOLO26 quantization scripts. We fetch these per variant rather than
-# auto-generate, because the MZ alls is tuned for accuracy parity (mixed-precision a16_w16 layers, adaround,
-# higher optimization level than our default).
-HAILO_MZ_YOLO26_ALLS_URL = (
-    "https://raw.githubusercontent.com/hailo-ai/hailo_model_zoo/master/hailo_model_zoo/cfg/alls/generic/"
-    "yolo26{scale}.alls"
-)
+# --- Hailo Model Zoo resolver ------------------------------------------------------------------------
+#
+# All Hailo exports load an alls (model script) tuned for the (model, hw_arch, DFC version) triple.
+# The Model Zoo publishes per-device alls under cfg/alls/{hw_arch}/base/{stem}.alls (preferred) and a
+# device-agnostic fallback at cfg/alls/generic/{stem}.alls. yolov8 / yolo11 alls reference a separate
+# nms_postprocess(...) JSON also in the zoo; we fetch it alongside the alls and patch user-supplied
+# conf / iou / max_det into it. yolo26 alls have no on-device NMS — used as-is.
+#
+# DFC ↔ MZ tag mapping
+#   • Hailo10H / 15H / 15L: DFC X.Y → MZ tag vX.Y.0 (numerically aligned).
+#   • Hailo8 / 8L         : MZ v2.x line; mapping is not numerical (e.g. v2.18 ↔ DFC 3.33). We resolve
+#                            it dynamically by parsing each candidate v2.x tag's docs/GETTING_STARTED.rst
+#                            for the declared DFC version. v2.18 is the first v2.x with `supported_hw_arch`
+#                            in the network YAMLs, so we refuse DFC < 3.33 for h8 / h8l.
+HAILO_MZ_RAW_BASE = "https://raw.githubusercontent.com/hailo-ai/hailo_model_zoo/{tag}/{path}"
+HAILO_MZ_TAGS_API = "https://api.github.com/repos/hailo-ai/hailo_model_zoo/tags?per_page=100"
+H8_DEVICES = frozenset({"hailo8", "hailo8l"})
+H8_MIN_DFC_VERSION = (3, 33)
+H8_MIN_MZ_TAG = "v2.18"
+DFC_VERSION_RE = re.compile(r"Hailo\s+Dataflow\s+Compiler\s+v?(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
+NMS_POSTPROCESS_RE = re.compile(r'(nms_postprocess\(\s*")([^"]+\.json)(")', re.IGNORECASE)
 
 
-def _resolve_model_script(
-    model_script: str | Path | None,
-    task: str,
-    nms_config_path: str | Path | None,
-) -> str:
-    """Return the Hailo model script ('alls') content to load into the compiler.
+def _resolve_model_script(model_script: str | Path | None) -> str | None:
+    """Read a user-supplied alls override; return None when not provided.
+
+    The auto-generation path that previously lived here is gone — alls now come from the Hailo Model
+    Zoo via the resolver chain. ``model_script=`` remains as the escape hatch.
 
     Args:
-        model_script (str | Path | None): User override or family-specific alls path. If a file path,
-            read its content; if it looks like alls content (multi-line / contains ``(``), pass through.
-        task (str): Ultralytics task (only ``"detect"`` is supported in this initial release).
-        nms_config_path (str | Path | None): Path to a ``meta_arch=yolov8`` NMS-postprocess JSON config.
-            Used only when ``model_script`` is None (yolov8 / yolo11 path); ignored otherwise.
+        model_script (str | Path | None): User override. May be a file path or raw alls content. When
+            None, the caller will run the MZ resolver instead.
 
     Returns:
-        (str): The alls script content.
+        (str | None): The alls content as a string, or None if ``model_script`` is None.
     """
-    if model_script is not None:
-        s = str(model_script)
-        p = Path(s)
-        if p.is_file():
-            return p.read_text()
-        # Heuristic: alls scripts contain function calls (with newlines / parens). A short single-line value
-        # without parens is almost certainly a path the user meant to point at — fail loudly rather than
-        # ship the literal string to the compiler as alls content.
-        if "\n" in s or "(" in s:
-            return s
-        raise FileNotFoundError(
-            f"model_script={model_script!r} is not a file and does not look like alls content. "
-            f"Pass either a path to an existing .alls file or raw alls script content."
-        )
-
-    if task != "detect":
-        raise NotImplementedError(
-            f"Hailo export currently only auto-generates a model script for task='detect', got task='{task}'. "
-            f"Pass a custom alls via model_script= to compile other tasks."
-        )
-
-    optimization = "model_optimization_flavor(optimization_level=2, compression_level=0)"
-    # The chip divides input by 255 internally, so the calibration / inference API expects RGB uint8 [0, 255].
-    normalization = "normalization1 = normalization([0.0, 0.0, 0.0], [255.0, 255.0, 255.0])"
-    nms_postprocess = f'nms_postprocess("{nms_config_path}", meta_arch=yolov8, engine=cpu)'
-    return f"{optimization}\n{normalization}\n{nms_postprocess}\n"
+    if model_script is None:
+        return None
+    s = str(model_script)
+    # Resolve `~` and relative paths first so a value like `~/scripts/(hailo).alls` is treated as a
+    # path (not as content just because it contains `(`).
+    p = Path(s).expanduser()
+    if p.is_file():
+        return p.read_text()
+    # Treat as raw alls content only with a strong sentinel: multi-line, OR contains a known alls
+    # top-level call. Bare `(` is too weak — a stray path with parens would be silently shipped.
+    alls_sentinels = ("normalization", "nms_postprocess", "model_optimization_flavor", "quantization")
+    if "\n" in s or any(tok in s for tok in alls_sentinels):
+        return s
+    raise FileNotFoundError(
+        f"model_script={model_script!r} is not a file and does not look like alls content. "
+        f"Pass either a path to an existing .alls file or raw alls script content."
+    )
 
 
-def _build_nms_config(
-    runner,
-    conf: float,
-    iou: float,
-    num_classes: int,
-    imgsz: tuple[int, int],
-    max_det: int,
-    reg_max: int,
-) -> dict:
-    """Build the ``meta_arch=yolov8`` JSON config for ``nms_postprocess`` from the parsed HailoNN.
-
-    Inspects the HailoNN that came out of ``translate_onnx_model`` to find the 6 conv leaves of the Detect
-    head (3 strides x {box reg, class logits}), classifies each by output channel count, sorts by spatial
-    dim to recover stride order, and emits a config dict the SDK expects.
-
-    Args:
-        runner: HailoSDK ``ClientRunner`` after ``translate_onnx_model`` has run.
-        conf (float): NMS score threshold.
-        iou (float): NMS IoU threshold.
-        num_classes (int): Number of object classes (matches cls conv channel count).
-        imgsz (tuple[int, int]): Model input ``(height, width)``.
-        max_det (int): Max proposals per class for on-chip NMS.
-        reg_max (int): DFL ``reg_max`` (default 16 for YOLOv8). Box reg conv channel count is ``4 * reg_max``.
+def _resolve_dfc_version() -> tuple[int, int, int]:
+    """Read the installed Hailo Dataflow Compiler version. Hard-fail with guidance if absent.
 
     Returns:
-        (dict): JSON-serializable config dict ready to pass to ``nms_postprocess``.
+        (tuple[int, int, int]): ``(major, minor, patch)`` (patch defaults to 0 if not exposed).
+    """
+    try:
+        import hailo_sdk_client
+    except ImportError as e:
+        raise RuntimeError(
+            "Hailo Dataflow Compiler ('hailo_sdk_client') is not installed; cannot resolve the matching "
+            "Model Zoo tag. Install DFC from https://hailo.ai/developer-zone/, or pass model_script= to "
+            "bypass the MZ resolver."
+        ) from e
+    raw = (
+        getattr(hailo_sdk_client, "__version__", None)
+        or getattr(getattr(hailo_sdk_client, "version", None), "__version__", None)
+        or getattr(hailo_sdk_client, "VERSION", None)
+    )
+    if not raw:
+        raise RuntimeError(
+            "Could not determine the installed Hailo DFC version (no __version__ / VERSION attribute on "
+            "hailo_sdk_client). Upgrade the SDK or pass model_script= explicitly to bypass the MZ resolver."
+        )
+    match = re.match(r"v?(\d+)\.(\d+)(?:\.(\d+))?", str(raw))
+    if not match:
+        raise RuntimeError(
+            f"Unrecognized Hailo DFC version string {raw!r}; expected MAJOR.MINOR[.PATCH]. Upgrade the SDK "
+            f"or pass model_script= explicitly to bypass the MZ resolver."
+        )
+    return int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
+
+
+def _resolve_mz_tag(dfc_version: tuple[int, int, int], hw_arch: str) -> str:
+    """Map a DFC version + target device to the Hailo Model Zoo git tag.
+
+    Args:
+        dfc_version (tuple[int, int, int]): ``(major, minor, patch)``.
+        hw_arch (str): Hailo device name (matches MZ folder name).
+
+    Returns:
+        (str): MZ git tag (e.g. ``"v5.2.0"`` for h10h/h15h/h15l, ``"v2.18"`` for h8/h8l).
 
     Raises:
-        RuntimeError: If 3 box-reg and 3 class conv leaves cannot be located in the parsed HailoNN.
+        NotImplementedError: For h8/h8l with DFC below ``H8_MIN_DFC_VERSION``.
     """
-    hn = runner.get_hn_model()
-    reg_channels = 4 * reg_max
-    reg_layers, cls_layers = [], []
-    for output in hn.get_output_layers():
-        for pred in hn.predecessors(output):
-            channels = pred.output_shapes[0][-1]  # NHWC
-            if channels == reg_channels:
-                reg_layers.append(pred)
-            elif channels == num_classes:
-                cls_layers.append(pred)
+    if hw_arch in H8_DEVICES:
+        if dfc_version < H8_MIN_DFC_VERSION:
+            raise NotImplementedError(
+                f"Hailo8/8L export needs DFC >= {H8_MIN_DFC_VERSION[0]}.{H8_MIN_DFC_VERSION[1]} "
+                f"(MZ {H8_MIN_MZ_TAG} is the first v2.x release with supported_hw_arch metadata). "
+                f"Installed DFC: {dfc_version[0]}.{dfc_version[1]}.{dfc_version[2]}. Upgrade DFC, or pass "
+                f"model_script= to bypass the MZ resolver."
+            )
+        return _h8_dfc_to_mz_tag(dfc_version)
+    return f"v{dfc_version[0]}.{dfc_version[1]}.0"
 
-    if len(reg_layers) != 3 or len(cls_layers) != 3:
+
+def _h8_dfc_to_mz_tag(dfc_version: tuple[int, int, int]) -> str:
+    """Resolve the Hailo Model Zoo v2.x tag for a Hailo8 / Hailo8L DFC version.
+
+    The DFC ↔ MZ mapping for the v2.x line is documented per-tag in
+    ``docs/GETTING_STARTED.rst``. We parse each candidate tag's doc and cache the result on disk so
+    subsequent exports don't re-fetch.
+
+    Args:
+        dfc_version (tuple[int, int, int]): ``(major, minor, patch)``.
+
+    Returns:
+        (str): Matching MZ git tag (e.g. ``"v2.18"``).
+
+    Raises:
+        RuntimeError: If the GitHub tags API or doc fetches fail, or no v2.x tag declares the
+            installed DFC version.
+    """
+    cache = _load_h8_index()
+    key = ".".join(str(p) for p in dfc_version)
+    cached = cache.get(key)
+    if cached:
+        return cached
+
+    candidate_tags = _list_mz_v2_tags()
+    if not candidate_tags:
         raise RuntimeError(
-            f"Expected 3 box-reg ({reg_channels} ch) + 3 cls ({num_classes} ch) conv leaves at HailoNN "
-            f"outputs, found {len(reg_layers)} reg / {len(cls_layers)} cls. Cannot auto-build the "
-            f"nms_postprocess JSON config; pass a custom alls via model_script=."
+            "Failed to list Hailo Model Zoo v2.x tags from the GitHub API; cannot resolve the DFC "
+            "<-> MZ mapping for Hailo8/8L. Check connectivity to api.github.com or pass model_script=."
         )
 
-    # Sort by spatial dim descending: largest = stride 8, then 16, then 32
-    reg_layers.sort(key=lambda layer: -layer.output_shapes[0][1])
-    cls_layers.sort(key=lambda layer: -layer.output_shapes[0][1])
+    tried: list[str] = []
+    for tag in candidate_tags:
+        rst = _fetch_text(HAILO_MZ_RAW_BASE.format(tag=tag, path="docs/GETTING_STARTED.rst"))
+        tried.append(tag)
+        if rst is None:
+            continue
+        match = DFC_VERSION_RE.search(rst)
+        if not match:
+            continue
+        ver = (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+        cache[".".join(str(p) for p in ver)] = tag
+        if ver == dfc_version:
+            _save_h8_index(cache)
+            return tag
+    _save_h8_index(cache)
+    raise RuntimeError(
+        f"No Hailo Model Zoo v2.x tag declares DFC {key}. Tags inspected: {tried}. Upgrade DFC, or pass "
+        f"model_script= to bypass the MZ resolver."
+    )
 
-    strides = (8, 16, 32)
-    bbox_decoders = [
-        {
-            "name": f"bbox_decoder{i}",
-            "stride": stride,
-            "reg_layer": reg.name,
-            "cls_layer": cls.name,
-        }
-        for i, (stride, reg, cls) in enumerate(zip(strides, reg_layers, cls_layers))
-    ]
 
-    return {
-        "nms_scores_th": float(conf),
-        "nms_iou_th": float(iou),
-        "image_dims": [int(imgsz[0]), int(imgsz[1])],
-        "max_proposals_per_class": int(max_det),
-        "classes": int(num_classes),
-        "regression_length": int(reg_max),
-        "background_removal": False,
-        "bbox_decoders": bbox_decoders,
-    }
+def _h8_index_path() -> Path:
+    """Disk location for the cached H8 DFC↔MZ index."""
+    return Path.home() / ".cache" / "ultralytics" / "hailo_mz_index.json"
+
+
+def _load_h8_index() -> dict:
+    """Load the cached H8 DFC↔MZ index, or an empty dict if absent / corrupt."""
+    p = _h8_index_path()
+    if not p.is_file():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_h8_index(index: dict) -> None:
+    """Persist the H8 DFC↔MZ index. Best-effort — failures are logged but non-fatal."""
+    p = _h8_index_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(index, indent=2, sort_keys=True))
+    except OSError as e:
+        LOGGER.warning(f"Hailo: could not write MZ index cache at {p}: {e}")
+
+
+def _fetch_text(url: str, timeout: float = 15.0) -> str | None:
+    """GET a URL with urllib and return the response body as text. None on any failure."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "ultralytics-hailo-resolver"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        LOGGER.debug(f"Hailo: GET {url} failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _list_mz_v2_tags() -> list[str]:
+    """List Hailo Model Zoo v2.x git tags >= ``H8_MIN_MZ_TAG``, sorted descending (newest first).
+
+    Hits the unauthenticated GitHub API; rate limit ~60 req/hour is plenty for occasional exports.
+    """
+    body = _fetch_text(HAILO_MZ_TAGS_API)
+    if body is None:
+        return []
+    try:
+        tags = [item["name"] for item in json.loads(body) if isinstance(item, dict) and "name" in item]
+    except json.JSONDecodeError:
+        return []
+    pattern = re.compile(r"^v(2)\.(\d+)(?:\.(\d+))?$")
+    candidates: list[tuple[tuple[int, int, int], str]] = []
+    min_minor = int(H8_MIN_MZ_TAG.split(".")[1])
+    for tag in tags:
+        match = pattern.match(tag)
+        if not match:
+            continue
+        version = (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+        if version[1] < min_minor:
+            continue
+        candidates.append((version, tag))
+    candidates.sort(reverse=True)
+    return [tag for _, tag in candidates]
+
+
+def _fetch_mz_file(
+    mz_tag: str,
+    rel_path: str,
+    dest_dir: Path,
+    *,
+    dest_name: str | None = None,
+) -> Path | None:
+    """Download a single file from the Hailo Model Zoo at ``mz_tag``.
+
+    Args:
+        mz_tag (str): Git tag (e.g. ``"v5.2.0"``).
+        rel_path (str): Path within the MZ repo (e.g. ``"hailo_model_zoo/cfg/alls/hailo10h/base/yolov8n.alls"``).
+        dest_dir (Path): Local destination directory.
+        dest_name (str | None): Override the saved filename (defaults to the URL basename).
+
+    Returns:
+        (Path | None): Local file path on success, ``None`` on 404 / network error so the caller
+        can try a fallback URL.
+    """
+    url = HAILO_MZ_RAW_BASE.format(tag=mz_tag, path=rel_path)
+    try:
+        result = safe_download(
+            url=url,
+            file=dest_name,
+            dir=dest_dir,
+            unzip=False,
+            retry=1,
+            exist_ok=True,
+        )
+    except Exception as e:
+        LOGGER.debug(f"Hailo: MZ fetch failed: {url} -> {type(e).__name__}: {e}")
+        return None
+    if not result:
+        return None
+    path = Path(result)
+    if not path.is_file():
+        return None
+    return path
+
+
+def _validate_hw_support(yaml_path: Path, stem: str, hw_arch: str) -> None:
+    """Assert ``hw_arch`` is in the MZ network YAML's ``supported_hw_arch`` list.
+
+    Raises:
+        NotImplementedError: If the YAML lacks ``supported_hw_arch`` or the arch isn't listed,
+            naming the actually supported arches so the user can pick a compatible target.
+    """
+    data = YAML.load(yaml_path) or {}
+    supported = data.get("supported_hw_arch")
+    if not supported:
+        raise NotImplementedError(
+            f"Hailo Model Zoo network YAML for {stem!r} has no 'supported_hw_arch' field at "
+            f"{yaml_path}; cannot validate the target device. Pass model_script= to bypass."
+        )
+    if hw_arch not in supported:
+        raise NotImplementedError(
+            f"{stem} is not supported on {hw_arch!r} per the Hailo Model Zoo. Supported devices: "
+            f"{sorted(supported)}. Pick a different hw_arch, or pass model_script= for a custom build."
+        )
+
+
+def _resolve_mz_alls(stem: str, mz_tag: str, hw_arch: str, dest_dir: Path) -> Path:
+    """Download the alls for ``stem`` at ``mz_tag``, preferring the HW-specific tuning over generic.
+
+    Args:
+        stem (str): Model stem (e.g. ``"yolov8n"``, ``"yolo26m"``).
+        mz_tag (str): MZ git tag.
+        hw_arch (str): Hailo device name.
+        dest_dir (Path): Local destination directory.
+
+    Returns:
+        (Path): Local path to the downloaded alls.
+
+    Raises:
+        RuntimeError: If neither the HW-specific nor the generic alls is available at this tag.
+    """
+    hw_rel = f"hailo_model_zoo/cfg/alls/{hw_arch}/base/{stem}.alls"
+    generic_rel = f"hailo_model_zoo/cfg/alls/generic/{stem}.alls"
+    LOGGER.info(f"Hailo: fetching MZ alls {hw_rel}@{mz_tag}")
+    path = _fetch_mz_file(mz_tag, hw_rel, dest_dir)
+    if path is not None:
+        return path
+    LOGGER.warning(
+        f"Hailo: HW-specific alls not found for {hw_arch} at {mz_tag}; falling back to generic. "
+        f"Accuracy may be lower than the device-tuned alls."
+    )
+    path = _fetch_mz_file(mz_tag, generic_rel, dest_dir)
+    if path is not None:
+        return path
+    raise RuntimeError(
+        f"Could not download an alls for {stem} at MZ {mz_tag}. Tried:\n"
+        f"  {HAILO_MZ_RAW_BASE.format(tag=mz_tag, path=hw_rel)}\n"
+        f"  {HAILO_MZ_RAW_BASE.format(tag=mz_tag, path=generic_rel)}\n"
+        f"Check connectivity, or pass model_script= to compile a custom variant."
+    )
+
+
+def _fetch_and_patch_nms_config(
+    alls_path: Path,
+    stem: str,
+    mz_tag: str,
+    dest_dir: Path,
+    *,
+    conf: float,
+    iou: float,
+    max_det: int,
+) -> Path:
+    """Download the MZ NMS JSON for a yolov8 / yolo11 alls and patch user thresholds in.
+
+    The alls's ``nms_postprocess(...)`` line references a JSON via a relative path (e.g.
+    ``"../../postprocess_config/yolov8n_nms_config.json"``). Both the HW-specific
+    (``cfg/alls/{hw_arch}/base/...``) and the generic (``cfg/alls/generic/...``) layouts resolve this
+    to ``cfg/postprocess_config/{stem}_nms_config.json`` at the MZ root. We download it, patch
+    ``nms_scores_th`` / ``nms_iou_th`` / ``max_proposals_per_class`` with the user's values, and
+    rewrite the alls file so its first arg is the absolute path of our local copy.
+
+    Args:
+        alls_path (Path): The downloaded MZ alls (mutated in place).
+        stem (str): Model stem (used for the JSON filename).
+        mz_tag (str): MZ git tag.
+        dest_dir (Path): Local directory to write the JSON into.
+        conf (float): NMS score threshold (overrides MZ default).
+        iou (float): NMS IoU threshold (overrides MZ default).
+        max_det (int): Max proposals per class (overrides MZ default).
+
+    Returns:
+        (Path): Local path to the patched NMS JSON.
+
+    Raises:
+        RuntimeError: If the alls has no ``nms_postprocess(...)`` line, or the JSON 404s.
+    """
+    alls_text = alls_path.read_text()
+    match = NMS_POSTPROCESS_RE.search(alls_text)
+    if match is None:
+        raise RuntimeError(
+            f"Hailo Model Zoo alls for {stem}@{mz_tag} ({alls_path}) has no nms_postprocess(...) line; "
+            f"cannot wire the on-device NMS config. Pass model_script= to compile a custom variant."
+        )
+    json_basename = Path(match.group(2)).name
+    rel_path = f"hailo_model_zoo/cfg/postprocess_config/{json_basename}"
+    local_name = f"{stem}_nms_config.json"
+    json_path = _fetch_mz_file(mz_tag, rel_path, dest_dir, dest_name=local_name)
+    if json_path is None:
+        raise RuntimeError(
+            f"Could not download MZ NMS JSON {rel_path}@{mz_tag}. "
+            f"URL: {HAILO_MZ_RAW_BASE.format(tag=mz_tag, path=rel_path)}. "
+            f"Pass model_script= to compile a custom variant."
+        )
+    config = json.loads(json_path.read_text())
+    config["nms_scores_th"] = float(conf)
+    config["nms_iou_th"] = float(iou)
+    config["max_proposals_per_class"] = int(max_det)
+    json_path.write_text(json.dumps(config, indent=2))
+    new_ref = f'{match.group(1)}{json_path.resolve()}{match.group(3)}'
+    alls_path.write_text(NMS_POSTPROCESS_RE.sub(new_ref, alls_text, count=1))
+    return json_path
 
 
 def _dataloader_to_numpy(dataloader) -> np.ndarray:
     """Stack a YOLO calibration dataloader into a single (N, H, W, C) uint8 RGB array.
 
-    Hailo's on-chip normalization layer expects raw RGB uint8 frames in [0, 255]; we therefore
+    Hailo's on-device normalization layer expects raw RGB uint8 frames in [0, 255]; we therefore
     keep the dataloader's native uint8 tensors and just permute BCHW → BHWC.
     """
     chunks: list[np.ndarray] = []
@@ -184,36 +444,44 @@ def onnx2hailo(
 ) -> str:
     """Compile an ONNX YOLO model to a Hailo HEF using the Hailo Dataflow Compiler.
 
-    Supports two model families with different on-chip / host-side splits:
+    The alls (model script) and on-device NMS JSON are pulled from the Hailo Model Zoo at the
+    git tag matching the installed DFC version. Per-device tuning (``cfg/alls/{hw_arch}/base/...``)
+    is preferred; a ``cfg/alls/generic/...`` fallback is used when the device-tuned variant is missing.
 
-    - ``yolov8`` / ``yolo11`` detect heads — uses on-chip NMS via ``nms_postprocess(meta_arch=yolov8)``.
-      A JSON config is auto-built from the parsed HailoNN and emitted alongside the HEF.
-    - ``yolo26`` detect heads — NMS-free end2end. The Hailo NPU does not support topk/gather, so the
-      postprocess runs on host (see ``HailoBackend``). The alls is fetched from the Hailo Model Zoo
-      (``cfg/alls/generic/yolo26{scale}.alls``) for accuracy parity, no on-chip NMS attached.
+    Supports two on-device / host-side splits:
+
+    - ``yolov8`` / ``yolo11`` — on-device NMS via ``nms_postprocess(meta_arch=yolov8)``. The MZ alls
+      references a JSON config which we fetch alongside it; user-supplied ``conf`` / ``iou`` /
+      ``max_det`` are patched into that JSON before compile.
+    - ``yolo26`` — NMS-free end2end. The Hailo NPU doesn't support topk/gather; postprocess runs on
+      host (see ``HailoBackend``). MZ alls is used as-is, no NMS JSON to fetch.
 
     Args:
         onnx_file (str): Path to the source ONNX file.
         output_dir (Path | str): Directory to write the compiled ``<model_name>.hef`` and metadata.
-        hw_arch (str): Hailo hardware target (one of ``HAILO_CHIPS``).
+        hw_arch (str): Hailo hardware target (one of ``HAILO_DEVICES``).
         task (str): Ultralytics task. Only ``"detect"`` is supported in this release.
         calibration_data (np.ndarray): (N, H, W, C) RGB uint8 calibration array [0-255].
         model_script (str | Path | None): Optional alls override (file path or raw alls content). When
-            provided, family-specific alls fetching and NMS JSON generation are skipped entirely.
-        conf (float): NMS score threshold (``nms_scores_th``).
-        iou (float): NMS IoU threshold (``nms_iou_th``).
-        num_classes (int): Number of object classes.
+            provided, the entire MZ resolver chain (DFC version detection, hw_arch validation, MZ alls
+            + NMS JSON fetch) is skipped.
+        conf (float): NMS score threshold (``nms_scores_th``); patched into the MZ NMS JSON.
+        iou (float): NMS IoU threshold (``nms_iou_th``); patched into the MZ NMS JSON.
+        num_classes (int): Number of object classes. Logged as a warning if != 80 (MZ baseline).
         imgsz (tuple[int, int]): Model input ``(height, width)``.
-        max_det (int): Max proposals per class for on-chip NMS / max detections for host postprocess.
-        reg_max (int): DFL ``reg_max`` (16 for YOLOv8, 1 for YOLO26).
+        max_det (int): Max proposals per class for on-device NMS / max detections for host postprocess.
+        reg_max (int): DFL ``reg_max`` (16 for YOLOv8, 1 for YOLO26). Persisted in metadata for the
+            host-side YOLO26 decode in ``HailoBackend``.
         metadata (dict | None): Metadata to persist alongside the HEF as ``metadata.yaml``. The function
-            adds family-specific postprocess params (``model_family``, ``strides``, ``reg_max``, etc.) so
-            ``HailoBackend`` can configure host-side decode at load time.
-        model_name (str): Name of the compiled HEF (without extension).
-        model_family (str): ``"yolov8"`` (default) or ``"yolo26"``. Selects the alls + decode path.
-        scale (str): YOLO26 scale letter — one of ``n`` / ``s`` / ``m`` / ``l`` (Hailo Model Zoo does not
-            publish an alls for ``x``). Required when ``model_family == "yolo26"`` and
-            ``model_script`` is None — used to fetch the matching alls from the Hailo Model Zoo.
+            adds family-specific postprocess params (``model_family``, ``strides``, ``reg_max``, etc.)
+            and the resolved ``hailo_mz_tag`` (when MZ was used) so ``HailoBackend`` can configure
+            host-side decode at load time.
+        model_name (str): Model file stem (e.g. ``"yolov8n"``); used directly as the MZ filename for
+            both the network YAML and the alls.
+        model_family (str): ``"yolov8"`` (default) or ``"yolo26"``. Controls whether the on-device NMS
+            JSON is fetched + patched (yolov8/yolo11) or skipped (yolo26).
+        scale (str): Model scale letter — only used to populate yolo26 metadata; MZ filenames are
+            keyed off ``model_name``, not ``scale``.
         end_node_names (list[str] | None): ONNX end-node names to cut the graph at. The caller computes
             these because the conv-leaf prefix is family-specific (``cv2``/``cv3`` for yolov8,
             ``one2one_cv2``/``one2one_cv3`` for yolo26).
@@ -224,19 +492,23 @@ def onnx2hailo(
 
     Raises:
         ImportError: If the Hailo Dataflow Compiler is not installed.
-        ValueError: If calibration data is missing or yolo26 scale is missing.
+        ValueError: If calibration data is missing.
+        RuntimeError: For DFC version detection failures, MZ download failures, or h8/h8l DFC↔MZ
+            mapping miss.
+        NotImplementedError: For DFC < 3.33 on h8/h8l, or when the model variant is missing /
+            unsupported on the requested device per the MZ network YAML.
     """
     if calibration_data is None or len(calibration_data) == 0:
         raise ValueError("Calibration data is required for Hailo quantization.")
     if calibration_data.dtype != np.uint8:
         LOGGER.warning(
             f"{prefix} calibration_data dtype is {calibration_data.dtype} — Hailo expects RGB uint8 in [0, 255]. "
-            f"On-chip normalization divides by 255; passing pre-normalized [0, 1] data will severely degrade accuracy."
+            f"On-device normalization divides by 255; passing pre-normalized [0, 1] data will severely degrade accuracy."
         )
     elif calibration_data.max() <= 1:
         LOGGER.warning(
             f"{prefix} calibration_data max value <= 1 — looks pre-normalized. Hailo expects raw RGB uint8 frames "
-            f"in [0, 255]; the chip normalizes by 255 internally."
+            f"in [0, 255]; the device normalizes by 255 internally."
         )
 
     try:
@@ -264,47 +536,44 @@ def onnx2hailo(
         translate_kwargs["end_node_names"] = list(end_node_names)
     runner.translate_onnx_model(onnx_file, model_name, **translate_kwargs)
 
-    nms_config_path: Path | None = None
-    resolved_model_script: str | Path | None = model_script
+    alls_text: str | None = _resolve_model_script(model_script)
+    mz_tag: str | None = None
 
-    if model_script is None and task == "detect":
-        if model_family == "yolo26":
-            # YOLO26: fetch the variant-specific alls from Hailo Model Zoo (no on-chip NMS, host postprocess).
-            if not scale:
-                raise ValueError(
-                    "model_family='yolo26' requires scale (n/s/m/l) to fetch the matching alls. "
-                    "Pass a custom alls via model_script= for non-standard variants."
-                )
-            alls_url = HAILO_MZ_YOLO26_ALLS_URL.format(scale=scale)
-            LOGGER.info(f"{prefix} fetching YOLO26 alls from Hailo Model Zoo: {alls_url}")
-            try:
-                resolved_model_script = safe_download(url=alls_url, dir=output_dir, exist_ok=True)
-            except Exception as e:
-                # safe_download retries 3x; surfacing here means the URL or the network is the issue.
-                # Reraise as a single clear RuntimeError so the user knows exactly what failed and how
-                # to work around it (custom alls path), instead of debugging a download stack trace.
-                raise RuntimeError(
-                    f"Failed to download the YOLO26 quantization script from the Hailo Model Zoo:\n"
-                    f"  url    : {alls_url}\n"
-                    f"  output : {output_dir}\n"
-                    f"  cause  : {type(e).__name__}: {e}\n"
-                    f"Common causes: (1) no internet / proxy blocking raw.githubusercontent.com, "
-                    f"(2) the Model Zoo restructured or removed yolo26{scale}.alls. "
-                    f"Workaround: download the alls manually and pass model_script=<path> to onnx2hailo."
-                ) from e
-            if not Path(resolved_model_script).is_file():
-                raise RuntimeError(
-                    f"Hailo Model Zoo alls download succeeded but no file was written at "
-                    f"{resolved_model_script!r}. Re-run, or pass model_script= explicitly to bypass the fetch."
-                )
-        else:
-            # yolov8 / yolo11: build the on-chip NMS JSON config from the parsed HailoNN.
-            nms_config = _build_nms_config(runner, conf, iou, num_classes, imgsz, max_det, reg_max)
-            nms_config_path = output_dir / f"{model_name}_nms_config.json"
-            nms_config_path.write_text(json.dumps(nms_config, indent=2))
+    if alls_text is None:
+        if task != "detect":
+            raise NotImplementedError(
+                f"Hailo export currently only resolves an alls for task='detect', got task='{task}'. "
+                f"Pass a custom alls via model_script= to compile other tasks."
+            )
+        if int(num_classes) != 80:
+            LOGGER.warning(
+                f"{prefix} num_classes={num_classes} differs from MZ's COCO80 baseline; the MZ alls is "
+                f"tuned for 80 classes — quantization quality on a custom-class model may regress. "
+                f"Pass model_script= for full custom-class accuracy parity."
+            )
+        dfc_version = _resolve_dfc_version()
+        mz_tag = _resolve_mz_tag(dfc_version, hw_arch)
+        LOGGER.info(f"{prefix} using Hailo Model Zoo tag {mz_tag} (DFC {'.'.join(map(str, dfc_version))}).")
+        yaml_path = _fetch_mz_file(
+            mz_tag,
+            f"hailo_model_zoo/cfg/networks/{model_name}.yaml",
+            output_dir,
+        )
+        if yaml_path is None:
+            raise NotImplementedError(
+                f"{model_name!r} is not published in Hailo Model Zoo at {mz_tag}; pass model_script= "
+                f"to compile a custom variant."
+            )
+        _validate_hw_support(yaml_path, model_name, hw_arch)
+        alls_path = _resolve_mz_alls(model_name, mz_tag, hw_arch, output_dir)
+        if model_family != "yolo26":
+            _fetch_and_patch_nms_config(
+                alls_path, model_name, mz_tag, output_dir,
+                conf=conf, iou=iou, max_det=max_det,
+            )
+        alls_text = alls_path.read_text()
 
-    alls = _resolve_model_script(resolved_model_script, task, nms_config_path)
-    runner.load_model_script(alls)
+    runner.load_model_script(alls_text)
     runner.optimize(calibration_data)
 
     hef_bytes = runner.compile()
@@ -312,10 +581,12 @@ def onnx2hailo(
     hef_path.write_bytes(hef_bytes)
 
     if metadata is not None:
-        # Family-specific params HailoBackend needs at load time. yolov8's on-chip NMS path doesn't need
+        # Family-specific params HailoBackend needs at load time. yolov8's on-device NMS path doesn't need
         # most of these, but writing them for both keeps the metadata schema uniform.
         metadata = dict(metadata)
         metadata["model_family"] = model_family
+        if mz_tag:
+            metadata["hailo_mz_tag"] = mz_tag
         if model_family == "yolo26":
             metadata.update(
                 {
@@ -325,8 +596,54 @@ def onnx2hailo(
                     "max_det": int(max_det),
                     "conf": float(conf),
                     "imgsz": [int(imgsz[0]), int(imgsz[1])],
+                    "head_outputs": _yolo26_head_outputs(runner, list(end_node_names or [])),
                 }
             )
         YAML.save(output_dir / "metadata.yaml", metadata)
 
     return str(output_dir)
+
+
+def _yolo26_head_outputs(runner, end_node_names: list[str]) -> dict:
+    """Capture YOLO26 head-leaf metadata so the runtime can dispatch by name, not channel count.
+
+    The exporter cuts the ONNX at 6 conv leaves interleaved as
+    ``[cv2_0, cv3_0, cv2_1, cv3_1, cv2_2, cv3_2]``. Even indices are box-reg heads, odd are class heads.
+    We persist the HailoNN layer names and their spatial sizes (per stride) so ``HailoBackend`` can
+    pre-classify output buffers without relying on channel counts — which is ambiguous when ``nc == 4``
+    (e.g. a 4-class custom dataset puts every leaf into both the box and cls bucket).
+
+    Args:
+        runner: HailoSDK ``ClientRunner`` after ``compile()``.
+        end_node_names (list[str]): Cut node names (interleaved). Used only as a sanity check on count.
+
+    Returns:
+        (dict): ``{"box_layers": [{"name": str, "spatial": int}, ...],
+        "cls_layers": [...]}`` — per-stride entries sorted by descending spatial dim
+        (largest = stride[0]). Empty dict if the layout cannot be determined.
+    """
+    try:
+        hn = runner.get_hn_model()
+        output_preds: list = []
+        for o in hn.get_output_layers():
+            output_preds.extend(hn.predecessors(o))
+        if end_node_names and len(output_preds) != len(end_node_names):
+            LOGGER.warning(
+                f"Hailo: expected {len(end_node_names)} HN output predecessors, got {len(output_preds)}; "
+                f"head_outputs metadata will be omitted (runtime falls back to channel-count dispatch)."
+            )
+            return {}
+        box_layers = output_preds[0::2]
+        cls_layers = output_preds[1::2]
+        box_layers.sort(key=lambda layer: -layer.output_shapes[0][1])
+        cls_layers.sort(key=lambda layer: -layer.output_shapes[0][1])
+        return {
+            "box_layers": [{"name": layer.name, "spatial": int(layer.output_shapes[0][1])} for layer in box_layers],
+            "cls_layers": [{"name": layer.name, "spatial": int(layer.output_shapes[0][1])} for layer in cls_layers],
+        }
+    except Exception as e:
+        LOGGER.warning(
+            f"Hailo: failed to derive YOLO26 head_outputs metadata ({type(e).__name__}: {e}); "
+            f"runtime will fall back to channel-count dispatch."
+        )
+        return {}

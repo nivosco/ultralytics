@@ -68,7 +68,7 @@ RKNN_CHIPS = frozenset(
         "rv1126b",
     }
 )  # Rockchip processors available for export
-HAILO_CHIPS = frozenset(
+HAILO_DEVICES = frozenset(
     {
         "hailo8",
         "hailo8l",
@@ -76,7 +76,7 @@ HAILO_CHIPS = frozenset(
         "hailo15h",
         "hailo15l",
     }
-)  # Hailo chips available for export
+)  # Hailo devices available for export
 HELP_MSG = """
     Examples for running Ultralytics:
 

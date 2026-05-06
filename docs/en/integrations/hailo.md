@@ -1,6 +1,6 @@
 ---
 comments: true
-description: Deploy Ultralytics YOLO models on Hailo AI architectures. Compile YOLOv8 / YOLO11 / YOLO26 detection models to HEF, then run inference via HailoRT.
+description: Deploy Ultralytics YOLO models on Hailo AI HW. Compile YOLOv8 / YOLO11 / YOLO26 detection models to HEF, then run inference via HailoRT.
 keywords: Hailo, Hailo AI, Hailo-8, Hailo-10H, Hailo-15H, Hailo-15L, Hailo Dataflow Compiler, HailoRT, Edge AI, YOLOv8, YOLO11, YOLO26, Model Export, Computer Vision, Object Detection, quantization
 ---
 
@@ -12,7 +12,7 @@ Ultralytics supports exporting YOLO models to [Hailo](https://hailo.ai/) AI acce
 
 | Family | Detect head | NMS location | Notes |
 | :--- | :--- | :--- | :--- |
-| **YOLOv8** / **YOLO11** | Anchor-free DFL (`reg_max=16`) | On-chip via `nms_postprocess(meta_arch=yolov8)` | Auto-generated NMS JSON config emitted alongside the HEF |
+| **YOLOv8** / **YOLO11** | Anchor-free DFL (`reg_max=16`) | On-device via `nms_postprocess(meta_arch=yolov8)` | Auto-generated NMS JSON config emitted alongside the HEF |
 | **YOLO26** (n / s / m / l) | NMS-free end2end (`reg_max=1`) | Host-side topk + gather | The Hailo NPU does not support topk/gather; postprocess runs on the host inside `HailoBackend`. The variant-specific quantization script (`yolo26{n,s,m,l}.alls`) is fetched automatically from the [Hailo Model Zoo](https://github.com/hailo-ai/hailo_model_zoo/tree/master/hailo_model_zoo/cfg/alls/generic) for accuracy parity. **YOLO26x is not supported** (no MZ-published alls); pass a custom `model_script=` to compile it. |
 
 > **Other YOLO families** (YOLOv9 / YOLOv10 / YOLOv12) are **not yet supported** — the export pipeline raises `NotImplementedError` if you attempt one. Tracked for a future release.
@@ -46,7 +46,7 @@ Pass the chip name via the `name=` argument:
 ```python
 from ultralytics import YOLO
 
-# YOLOv8 / YOLO11 — auto-generated alls adds nms_postprocess(meta_arch=yolov8); NMS runs on-chip.
+# YOLOv8 / YOLO11 — auto-generated alls adds nms_postprocess(meta_arch=yolov8); NMS runs on-device.
 YOLO("yolov8n.pt").export(format="hailo", data="coco8.yaml", name="hailo10h", imgsz=640)
 YOLO("yolo11n.pt").export(format="hailo", data="coco8.yaml", name="hailo10h", imgsz=640)
 
@@ -100,7 +100,7 @@ results = model.predict("bus.jpg")
 
 The Hailo runtime expects raw RGB `uint8` `[0, 255]` input. The standard Ultralytics predict pipeline emits a normalized float tensor; the backend silently casts it back to uint8 (matching the behavior of the Rockchip RKNN backend). `HailoBackend` reads `model_family` from the HEF directory's `metadata.yaml` and dispatches to the right decode path:
 
-- **YOLOv8 / YOLO11** — the chip's on-chip NMS emits per-class detection lists which the backend rescales to input-pixel coords.
+- **YOLOv8 / YOLO11** — the on-device NMS emits per-class detection lists which the backend rescales to input-pixel coords.
 - **YOLO26** — the chip emits 6 raw conv outputs (3 strides × {box-reg, class-logits}); the backend builds anchors per stride, applies `dist2bbox` + sigmoid, and runs a top-k selection over (anchor × class) pairs on host (the same math as `Detect.postprocess` for end2end models).
 
 Both paths return `(1, N, 6)` `[x1, y1, x2, y2, conf, cls]` in input-pixel coords and the predictor's end2end branch consumes them directly.

@@ -387,7 +387,7 @@ def test_export_axelera():
 @pytest.mark.slow
 @pytest.mark.skipif(not LINUX, reason="Hailo export is only supported on Linux")
 def test_export_hailo():
-    """Test YOLO export to Hailo HEF format (yolov8 on-chip NMS path).
+    """Test YOLO export to Hailo HEF format (yolov8 on-device NMS path).
 
     Note: YOLO26 export is verified manually with a 1024-image calibration set — the Hailo Model Zoo
     alls hardcodes calibset_size=1024 and adaround, neither of which work on the 4-image coco8 set
@@ -412,3 +412,87 @@ def test_export_hailo():
 
     # Note: Inference testing skipped as it requires Hailo hardware.
     shutil.rmtree(file, ignore_errors=True)
+
+
+@pytest.mark.slow
+def test_hailo_decode_nms_shape_sort_and_cap():
+    """``_decode_nms`` returns (1, N, 6) descending by confidence and capped at ``max_det``."""
+    import numpy as np
+
+    from ultralytics.nn.backends.hailo import HailoBackend
+
+    per_class = [
+        np.array([[0.10, 0.10, 0.20, 0.20, 0.90], [0.30, 0.30, 0.40, 0.40, 0.70]], dtype=np.float32),
+        np.array([[0.50, 0.50, 0.60, 0.60, 0.95]], dtype=np.float32),
+        None,
+    ]
+    out = HailoBackend._decode_nms(per_class, imgsz_h=640, imgsz_w=640, max_det=2)
+    assert out.shape == (1, 2, 6), out.shape
+    assert out[0, 0, 4] > out[0, 1, 4], "scores must be sorted descending"
+    # Class 1 (score 0.95) is normalized [ymin=0.5, xmin=0.5, ymax=0.6, xmax=0.6] → pixel xyxy [320,320,384,384]
+    np.testing.assert_allclose(out[0, 0, :4], [320, 320, 384, 384], atol=1e-4)
+    assert int(out[0, 0, 5]) == 1
+
+
+@pytest.mark.slow
+def test_hailo_yolo26_postprocess_decode_math():
+    """Synthetic single-anchor activation decodes to the anchor's expected pixel xyxy box.
+
+    Mirrors ``Detect._inference`` for ``reg_max=1`` end2end: anchor center at ``(x+0.5, y+0.5)``
+    in stride units, l/t/r/b distances applied, scaled by stride.
+    """
+    import numpy as np
+
+    from ultralytics.nn.backends.hailo import HailoBackend
+
+    nc = 80
+    strides = [8, 16, 32]
+    box_bufs = [
+        np.zeros((1, 8, 8, 4), dtype=np.float32),
+        np.zeros((1, 4, 4, 4), dtype=np.float32),
+        np.zeros((1, 2, 2, 4), dtype=np.float32),
+    ]
+    cls_bufs = [
+        np.zeros((1, 8, 8, nc), dtype=np.float32),
+        np.zeros((1, 4, 4, nc), dtype=np.float32),
+        np.zeros((1, 2, 2, nc), dtype=np.float32),
+    ]
+    # Activate a single anchor at (gy=2, gx=3) in the largest scale (stride 8), class 5,
+    # with l/t/r/b distances = 1 stride unit each, very high logit for sigmoid → ~1.
+    box_bufs[0][0, 2, 3, :] = 1.0
+    cls_bufs[0][0, 2, 3, 5] = 10.0
+
+    out = HailoBackend._yolo26_postprocess(box_bufs, cls_bufs, strides=strides, nc=nc, max_det=5, conf=0.1)
+
+    assert out.shape[0] == 1 and out.shape[2] == 6
+    top = out[0, 0]
+    # Anchor center at (gx+0.5, gy+0.5) = (3.5, 2.5) stride units.
+    # l=t=r=b=1 → x1=(3.5-1)*8=20, y1=(2.5-1)*8=12, x2=(3.5+1)*8=36, y2=(2.5+1)*8=28
+    np.testing.assert_allclose(top[:4], [20, 12, 36, 28], atol=1e-4)
+    assert top[4] > 0.99  # sigmoid(10) ≈ 0.9999
+    assert int(top[5]) == 5
+
+
+@pytest.mark.slow
+def test_hailo_yolo26_postprocess_topk_and_conf_drop():
+    """``max_det`` caps the (anchor × class) top-k; ``conf`` filters below threshold."""
+    import numpy as np
+
+    from ultralytics.nn.backends.hailo import HailoBackend
+
+    nc = 4
+    strides = [8]
+    box_bufs = [np.zeros((1, 4, 4, 4), dtype=np.float32)]
+    cls_bufs = [np.zeros((1, 4, 4, nc), dtype=np.float32)]
+    # Plant five strong activations and one weak one to force conf filtering.
+    cls_bufs[0][0, 0, 0, 0] = 5.0
+    cls_bufs[0][0, 0, 1, 1] = 4.0
+    cls_bufs[0][0, 0, 2, 2] = 3.0
+    cls_bufs[0][0, 0, 3, 3] = 2.0
+    cls_bufs[0][0, 1, 0, 0] = 1.0
+    cls_bufs[0][0, 1, 1, 1] = -3.0  # sigmoid ≈ 0.047 — below conf=0.1
+
+    out = HailoBackend._yolo26_postprocess(box_bufs, cls_bufs, strides=strides, nc=nc, max_det=3, conf=0.1)
+    assert out.shape == (1, 3, 6), f"max_det should cap to 3, got {out.shape}"
+    # All survivors must clear conf
+    assert (out[0, :, 4] > 0.1).all()
