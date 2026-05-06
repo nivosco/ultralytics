@@ -29,13 +29,15 @@ If either package is missing, Ultralytics raises an `ImportError` directing you 
 
 Pass the chip name via the `name=` argument:
 
-| `name=`    | Chip       | Notes                                  |
-| :--------- | :--------- | :------------------------------------- |
-| `hailo8`   | Hailo-8    | DRAM-less AI Accelerator               |
-| `hailo8l`  | Hailo-8L   | Smaller Hailo-8 variant                |
-| `hailo10h` | Hailo-10H  | **Default.** AI Accelerator            |
-| `hailo15h` | Hailo-15H  | Embedded SoC (high end)                |
-| `hailo15l` | Hailo-15L  | Embedded SoC (cost effective)          |
+| `name=`    | Chip       | Class       | Host inference | Notes                                  |
+| :--------- | :--------- | :---------- | :------------- | :------------------------------------- |
+| `hailo8`   | Hailo-8    | Accelerator | ✅              | DRAM-less AI Accelerator               |
+| `hailo8l`  | Hailo-8L   | Accelerator | ✅              | Smaller Hailo-8 variant                |
+| `hailo10h` | Hailo-10H  | Accelerator | ✅              | **Default.** AI Accelerator            |
+| `hailo15h` | Hailo-15H  | SoC         | ❌              | Embedded SoC (high end)                |
+| `hailo15l` | Hailo-15L  | SoC         | ❌              | Embedded SoC (cost effective)          |
+
+> **Host inference is supported only on Hailo accelerators (Hailo-8 / 8L / 10H).** The Hailo-15H / 15L are SoC targets — the compiled HEF must be deployed onto the device and executed there; HailoRT VDevice on a host cannot drive them. Ultralytics still **exports** for these targets, but `YOLO("…_hailo_model").predict(…)` on a host raises `NotImplementedError` for SoC HEFs.
 
 > **Note on `name=`** — Ultralytics' `name` argument also controls the run sub-directory under `runs/<task>/`. Following the same convention used by Rockchip RKNN, the Hailo export reuses it for the chip target, so a default Hailo export lands at `runs/<task>/hailo10h/`.
 
@@ -94,6 +96,8 @@ The high-level `YOLO(...).export(format="hailo")` path uses the family-specific 
 
 ## Inference
 
+> **Accelerators only.** Host-side inference via Ultralytics is supported for Hailo-8 / 8L / 10H. HEFs compiled for the Hailo-15H / 15L SoC targets are intended to run on the device itself — `HailoBackend` rejects them at load time with a `NotImplementedError`.
+
 ```python
 from ultralytics import YOLO
 
@@ -112,5 +116,6 @@ Both paths return `(1, N, 6)` `[x1, y1, x2, y2, conf, cls]` in input-pixel coord
 
 - **`ImportError: Hailo Dataflow Compiler ('hailo_sdk_client') is required ...`** — install the DFC from the [Hailo Developer Zone](https://hailo.ai/developer-zone/).
 - **`ImportError: HailoRT ('hailo_platform') is required ...`** — install HailoRT from the [Hailo Developer Zone](https://hailo.ai/developer-zone/).
+- **`NotImplementedError: This HEF was compiled for hw_arch='hailo15h' / 'hailo15l', a Hailo SoC target ...`** — SoC HEFs run on the device, not the host. Either re-export with `name=hailo8` / `hailo8l` / `hailo10h` for host-side inference, or deploy the existing HEF to the SoC and run it there.
 - **Severely degraded mAP after quantization** — most common causes are (1) calibration data passed as pre-normalized `float [0, 1]` instead of `uint8 [0, 255]`, or (2) fewer than 1024 calibration images. Both emit warnings during export.
 - **Tasks other than detect** — pose, segmentation, OBB, and classification are not yet auto-supported. You can still compile them by supplying a custom `model_script=` and using the lower-level `onnx2hailo()` utility directly.

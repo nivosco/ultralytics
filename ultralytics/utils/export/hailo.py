@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +29,10 @@ from ultralytics.utils.downloads import safe_download
 #                            DFC release. v2.18 is the first v2.x release with ``supported_hw_arch``.
 HAILO_DEVICES = frozenset({"hailo8", "hailo8l", "hailo10h", "hailo15h", "hailo15l"})  # Hailo devices available for export
 H8_DEVICES = frozenset({"hailo8", "hailo8l"})
+# Hailo SoC targets (full-stack systems, not host-attached accelerators). Compiled HEFs are deployed
+# onto the device and executed there; HailoRT VDevice on a host cannot drive these chips, so the
+# inference backend rejects HEFs flagged with these arches up-front.
+SOC_DEVICES = frozenset({"hailo15h", "hailo15l"})
 
 # DFC (major, minor) → Model Zoo git tag for the v2.x line (Hailo8 / Hailo8L). The h8 line stalled at
 # MZ v2.x while h10h+ moved to v4+, so the mapping is per-release. Append a row when Hailo publishes a
@@ -133,6 +139,22 @@ def _resolve_mz_tag(dfc_version: tuple[int, int, int], hw_arch: str) -> str:
     return f"v{dfc_version[0]}.{dfc_version[1]}.0"
 
 
+def _url_exists(url: str, timeout: float = 10.0) -> bool:
+    """HEAD ``url`` and return True iff the server responds 2xx.
+
+    ``safe_download`` falls back to ``curl`` on retry, and curl happily writes a 404 HTML body to
+    disk and returns success — so the caller can't distinguish a real download from a saved error
+    page. A pre-flight HEAD lets ``_fetch_mz_file`` short-circuit on 404 without that ambiguity.
+    """
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        LOGGER.debug(f"Hailo: HEAD {url} failed: {type(e).__name__}: {e}")
+        return False
+
+
 def _fetch_mz_file(
     mz_tag: str,
     rel_path: str,
@@ -149,10 +171,14 @@ def _fetch_mz_file(
         dest_name (str | None): Override the saved filename (defaults to the URL basename).
 
     Returns:
-        (Path | None): Local file path on success, ``None`` on 404 / network error so the caller
-        can try a fallback URL.
+        (Path | None): Local file path on success, ``None`` when the URL 404s or the network is
+        unreachable so the caller can try a fallback URL.
     """
     url = HAILO_MZ_RAW_BASE.format(tag=mz_tag, path=rel_path)
+    # Pre-flight HEAD: safe_download's curl-on-retry path silently saves a 404 response body to
+    # disk and returns a Path, which would otherwise look like a successful fetch downstream.
+    if not _url_exists(url):
+        return None
     try:
         result = safe_download(
             url=url,
@@ -165,8 +191,6 @@ def _fetch_mz_file(
     except Exception as e:
         LOGGER.debug(f"Hailo: MZ fetch failed: {url} -> {type(e).__name__}: {e}")
         return None
-    if not result:
-        return None
     path = Path(result)
     if not path.is_file():
         return None
@@ -174,17 +198,17 @@ def _fetch_mz_file(
 
 
 def _validate_hw_support(yaml_path: Path, stem: str, hw_arch: str) -> None:
-    """Assert ``hw_arch`` is in the MZ network YAML's ``supported_hw_arch`` list.
+    """Assert ``hw_arch`` is in the MZ network YAML's ``info.supported_hw_arch`` list.
 
     Raises:
-        NotImplementedError: If the YAML lacks ``supported_hw_arch`` or the arch isn't listed,
+        NotImplementedError: If the YAML lacks ``info.supported_hw_arch`` or the arch isn't listed,
             naming the actually supported arches so the user can pick a compatible target.
     """
     data = YAML.load(yaml_path) or {}
-    supported = data.get("supported_hw_arch")
+    supported = (data.get("info") or {}).get("supported_hw_arch")
     if not supported:
         raise NotImplementedError(
-            f"Hailo Model Zoo network YAML for {stem!r} has no 'supported_hw_arch' field at "
+            f"Hailo Model Zoo network YAML for {stem!r} has no 'info.supported_hw_arch' field at "
             f"{yaml_path}; cannot validate the target device. Pass model_script= to bypass."
         )
     if hw_arch not in supported:
@@ -500,6 +524,7 @@ def onnx2hailo(
         # most of these, but writing them for both keeps the metadata schema uniform.
         metadata = dict(metadata)
         metadata["model_family"] = model_family
+        metadata["hw_arch"] = hw_arch
         if mz_tag:
             metadata["hailo_mz_tag"] = mz_tag
         if model_family == "yolo26":

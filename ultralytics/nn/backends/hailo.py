@@ -49,18 +49,7 @@ class HailoBackend(BaseBackend):
         Args:
             weight (str | Path): Path to a ``.hef`` file or to a ``_hailo_model/`` directory containing one.
         """
-        try:
-            from hailo_platform import FormatType, VDevice
-        except ImportError as e:
-            raise ImportError(
-                "HailoRT ('hailo_platform') is required for Hailo inference but is not installed.\n"
-                "Download HailoRT from:\n"
-                "  https://hailo.ai/developer-zone/software-downloads/\n"
-                "Install the runtime package AND the driver matching your hardware:\n"
-                "  - PCIe driver for M.2 / mPCIe accelerator modules\n"
-                "  - USB driver for USB dongle accelerators\n"
-                "then re-run inference. HailoRT is not on PyPI; manual install is required."
-            ) from e
+        from ultralytics.utils.export.hailo import SOC_DEVICES
 
         w = Path(weight)
         hef = w if w.is_file() and w.suffix == ".hef" else next(w.rglob("*.hef"), None)
@@ -81,6 +70,7 @@ class HailoBackend(BaseBackend):
             hailo_keys = {
                 "model_family",
                 "hailo_mz_tag",
+                "hw_arch",
                 "head_outputs",
                 "infer_timeout_ms",
                 "strides",
@@ -92,6 +82,33 @@ class HailoBackend(BaseBackend):
             hailo_meta = {k: raw[k] for k in hailo_keys if k in raw}
             metadata = {k: v for k, v in raw.items() if k not in hailo_keys}
             self.apply_metadata(metadata)
+
+        # Hailo-15H / 15L are SoC targets — the HEF is deployed onto the device and executed there.
+        # HailoRT VDevice on a host cannot drive a SoC, so reject up-front (before importing
+        # hailo_platform) with a message that points the user at the right deployment path.
+        hw_arch = hailo_meta.get("hw_arch")
+        if hw_arch in SOC_DEVICES:
+            raise NotImplementedError(
+                f"This HEF was compiled for hw_arch={hw_arch!r}, a Hailo SoC target "
+                f"({sorted(SOC_DEVICES)}). SoC devices do not support host-side inference via "
+                f"HailoRT VDevice — the HEF must be deployed onto the device and executed there. "
+                f"Host-side inference via Ultralytics is only supported for Hailo accelerators "
+                f"(hailo8 / hailo8l / hailo10h)."
+            )
+
+        try:
+            from hailo_platform import FormatType, VDevice
+        except ImportError as e:
+            raise ImportError(
+                "HailoRT ('hailo_platform') is required for Hailo inference but is not installed.\n"
+                "Download HailoRT from:\n"
+                "  https://hailo.ai/developer-zone/software-downloads/\n"
+                "Install the runtime package AND the driver matching your hardware:\n"
+                "  - PCIe driver for M.2 / mPCIe accelerator modules\n"
+                "  - USB driver for USB dongle accelerators\n"
+                "then re-run inference. HailoRT is not on PyPI; manual install is required."
+            ) from e
+
         self._hailo_meta = hailo_meta
         self._model_family = str(hailo_meta.get("model_family", "yolov8"))
         self._max_det = int(hailo_meta.get("max_det", 300))
