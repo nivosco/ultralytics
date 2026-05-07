@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 import re
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import numpy as np
+import requests
 import torch
 
 from ultralytics.utils import LOGGER, YAML
@@ -146,12 +145,15 @@ def _url_exists(url: str, timeout: float = 10.0) -> bool:
     ``safe_download`` falls back to ``curl`` on retry, and curl happily writes a 404 HTML body to
     disk and returns success — so the caller can't distinguish a real download from a saved error
     page. A pre-flight HEAD lets ``_fetch_mz_file`` short-circuit on 404 without that ambiguity.
+
+    Uses ``requests`` (not ``urllib``) so the pre-flight obeys the same proxy / CA bundle / auth
+    resolution as ``safe_download``; mismatched transports caused enterprise-network false negatives
+    where HEAD reported "missing" while the real fetch would have succeeded.
     """
     try:
-        req = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        r = requests.head(url, timeout=timeout, allow_redirects=True)
+        return r.ok
+    except requests.RequestException as e:
         LOGGER.debug(f"Hailo: HEAD {url} failed: {type(e).__name__}: {e}")
         return False
 
@@ -474,58 +476,60 @@ def onnx2hailo(
             f"Ensure the alls is tuned for hw_arch={hw_arch!r}; a mismatch will compile a misconfigured HEF."
         )
 
-    if alls_text is None:
-        if task != "detect":
-            raise NotImplementedError(
-                f"Hailo export currently only resolves an alls for task='detect', got task='{task}'. "
-                f"Pass a custom alls via model_script= to compile other tasks."
+    # Wrap fetch + compile in try/finally so resolver scratch files (network YAML + alls + NMS JSON)
+    # are cleaned up even when optimize/compile raises. The alls in particular is rewritten to embed an
+    # absolute local path to the NMS JSON, so leaving it on the failure path leaks host paths if the
+    # user tarballs the output dir for support.
+    try:
+        if alls_text is None:
+            if task != "detect":
+                raise NotImplementedError(
+                    f"Hailo export currently only resolves an alls for task='detect', got task='{task}'. "
+                    f"Pass a custom alls via model_script= to compile other tasks."
+                )
+            if int(num_classes) != 80:
+                LOGGER.warning(
+                    f"{prefix} num_classes={num_classes} differs from MZ's COCO80 baseline; the MZ alls is "
+                    f"tuned for 80 classes — quantization quality on a custom-class model may regress. "
+                    f"Pass model_script= for full custom-class accuracy parity."
+                )
+            dfc_version = _resolve_dfc_version()
+            mz_tag = _resolve_mz_tag(dfc_version, hw_arch)
+            LOGGER.info(f"{prefix} using Hailo Model Zoo tag {mz_tag} (DFC {'.'.join(map(str, dfc_version))}).")
+            yaml_path = _fetch_mz_file(
+                mz_tag,
+                f"hailo_model_zoo/cfg/networks/{model_name}.yaml",
+                output_dir,
             )
-        if int(num_classes) != 80:
-            LOGGER.warning(
-                f"{prefix} num_classes={num_classes} differs from MZ's COCO80 baseline; the MZ alls is "
-                f"tuned for 80 classes — quantization quality on a custom-class model may regress. "
-                f"Pass model_script= for full custom-class accuracy parity."
-            )
-        dfc_version = _resolve_dfc_version()
-        mz_tag = _resolve_mz_tag(dfc_version, hw_arch)
-        LOGGER.info(f"{prefix} using Hailo Model Zoo tag {mz_tag} (DFC {'.'.join(map(str, dfc_version))}).")
-        yaml_path = _fetch_mz_file(
-            mz_tag,
-            f"hailo_model_zoo/cfg/networks/{model_name}.yaml",
-            output_dir,
-        )
-        if yaml_path is None:
-            raise NotImplementedError(
-                f"{model_name!r} is not published in Hailo Model Zoo at {mz_tag}; pass model_script= "
-                f"to compile a custom variant."
-            )
-        mz_artifacts.append(yaml_path)
-        _validate_hw_support(yaml_path, model_name, hw_arch)
-        alls_path = _resolve_mz_alls(model_name, mz_tag, hw_arch, output_dir)
-        mz_artifacts.append(alls_path)
-        if model_family != "yolo26":
-            json_path = _fetch_and_patch_nms_config(
-                alls_path, model_name, mz_tag, output_dir,
-                conf=conf, iou=iou, max_det=max_det,
-            )
-            mz_artifacts.append(json_path)
-        alls_text = alls_path.read_text()
+            if yaml_path is None:
+                raise NotImplementedError(
+                    f"{model_name!r} is not published in Hailo Model Zoo at {mz_tag}; pass model_script= "
+                    f"to compile a custom variant."
+                )
+            mz_artifacts.append(yaml_path)
+            _validate_hw_support(yaml_path, model_name, hw_arch)
+            alls_path = _resolve_mz_alls(model_name, mz_tag, hw_arch, output_dir)
+            mz_artifacts.append(alls_path)
+            if model_family != "yolo26":
+                json_path = _fetch_and_patch_nms_config(
+                    alls_path, model_name, mz_tag, output_dir,
+                    conf=conf, iou=iou, max_det=max_det,
+                )
+                mz_artifacts.append(json_path)
+            alls_text = alls_path.read_text()
 
-    runner.load_model_script(alls_text)
-    runner.optimize(calibration_data)
+        runner.load_model_script(alls_text)
+        runner.optimize(calibration_data)
 
-    hef_bytes = runner.compile()
-    hef_path = output_dir / f"{model_name}.hef"
-    hef_path.write_bytes(hef_bytes)
-
-    # Resolver scratch files (network YAML + alls + NMS JSON) are no longer needed — the HEF holds the
-    # compiled graph and the JSON's thresholds are baked in. Leaving them around (especially the alls,
-    # which we rewrote with an absolute local path) leaks host paths if the user tarballs the dir.
-    for artifact in mz_artifacts:
-        try:
-            artifact.unlink(missing_ok=True)
-        except OSError as cleanup_error:
-            LOGGER.debug(f"Hailo: could not unlink scratch artifact {artifact}: {cleanup_error}")
+        hef_bytes = runner.compile()
+        hef_path = output_dir / f"{model_name}.hef"
+        hef_path.write_bytes(hef_bytes)
+    finally:
+        for artifact in mz_artifacts:
+            try:
+                artifact.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                LOGGER.debug(f"Hailo: could not unlink scratch artifact {artifact}: {cleanup_error}")
 
     if metadata is not None:
         # Family-specific params HailoBackend needs at load time. yolov8's on-device NMS path doesn't need

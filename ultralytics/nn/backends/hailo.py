@@ -231,18 +231,20 @@ class HailoBackend(BaseBackend):
             (list[np.ndarray]): Single-element list containing decoded predictions of shape ``(1, N, 6)``
             in ``[x1, y1, x2, y2, conf, cls]`` input-pixel coords.
         """
+        # im.shape is (B, H, W, C) post-permute. Both decode paths emit (1, N, 6); _yolo26_postprocess
+        # asserts B==1 internally, but _decode_nms ignores the batch dim, so guard here — before the
+        # torch→numpy copy (and float scale/clip/astype) so a B>1 input is rejected without that work.
+        if im.shape[0] != 1:
+            raise NotImplementedError(
+                f"HailoBackend currently only supports batch=1 inference, got input shape {tuple(im.shape)}."
+            )
+
         if im.dtype == torch.uint8:
             x = np.ascontiguousarray(im.cpu().numpy())
         else:
             # astype already returns a fresh contiguous array; no extra copy needed.
             x = (im.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
 
-        # im.shape is (B, H, W, C) post-permute. Both decode paths emit (1, N, 6); _yolo26_postprocess
-        # asserts B==1 internally, but _decode_nms ignores the batch dim, so guard here.
-        if x.shape[0] != 1:
-            raise NotImplementedError(
-                f"HailoBackend currently only supports batch=1 inference, got input shape {x.shape}."
-            )
         imgsz_h, imgsz_w = int(x.shape[1]), int(x.shape[2])
 
         self._bindings.input().set_buffer(x)
