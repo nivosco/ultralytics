@@ -27,7 +27,8 @@ from ultralytics.utils.downloads import safe_download
 #   • Hailo8 / 8L         : MZ v2.x line is not numerically aligned with DFC versions. The mapping is
 #                            maintained by hand in ``H8_DFC_TO_MZ_TAG`` below — refresh on each Hailo
 #                            DFC release. v2.18 is the first v2.x release with ``supported_hw_arch``.
-HAILO_DEVICES = frozenset({"hailo8", "hailo8l", "hailo10h", "hailo15h", "hailo15l"})  # Hailo devices available for export
+# Hailo devices available for export.
+HAILO_DEVICES = frozenset({"hailo8", "hailo8l", "hailo10h", "hailo15h", "hailo15l"})
 H8_DEVICES = frozenset({"hailo8", "hailo8l"})
 # Hailo SoC targets (full-stack systems, not host-attached accelerators). Compiled HEFs are deployed
 # onto the device and executed there; HailoRT VDevice on a host cannot drive these chips, so the
@@ -191,6 +192,12 @@ def _fetch_mz_file(
     except Exception as e:
         LOGGER.debug(f"Hailo: MZ fetch failed: {url} -> {type(e).__name__}: {e}")
         return None
+    # safe_download's return contract is a single path-like, but guard against a future change to
+    # list/None returns so the failure mode is "MZ fetch returned X" rather than a confusing
+    # TypeError from Path(None).
+    if not isinstance(result, (str, Path)):
+        LOGGER.debug(f"Hailo: MZ fetch returned unexpected type {type(result).__name__}: {result!r}")
+        return None
     path = Path(result)
     if not path.is_file():
         return None
@@ -314,7 +321,7 @@ def _fetch_and_patch_nms_config(
     # save NPU bandwidth but could starve a dominant class on class-imbalanced frames.
     config["max_proposals_per_class"] = int(max_det)
     json_path.write_text(json.dumps(config, indent=2))
-    new_ref = f'{match.group(1)}{json_path.resolve()}{match.group(3)}'
+    new_ref = f"{match.group(1)}{json_path.resolve()}{match.group(3)}"
     alls_path.write_text(NMS_POSTPROCESS_RE.sub(new_ref, alls_text, count=1))
     return json_path
 
@@ -419,7 +426,8 @@ def onnx2hailo(
     if calibration_data.dtype != np.uint8:
         LOGGER.warning(
             f"{prefix} calibration_data dtype is {calibration_data.dtype} — Hailo expects RGB uint8 in [0, 255]. "
-            f"On-device normalization divides by 255; passing pre-normalized [0, 1] data will severely degrade accuracy."
+            f"On-device normalization divides by 255; passing pre-normalized [0, 1] data will severely degrade "
+            f"accuracy."
         )
     elif calibration_data.max() <= 1:
         LOGGER.warning(

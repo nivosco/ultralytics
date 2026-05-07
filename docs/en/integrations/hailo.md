@@ -27,9 +27,9 @@ If either package is missing, Ultralytics raises an `ImportError` directing you 
 
 ## Supported hardware targets
 
-Pass the chip name via the `name=` argument:
+Pass the device name via the `name=` argument:
 
-| `name=`    | Chip       | Class       | Host inference | Notes                                  |
+| `name=`    | Device     | Class       | Host inference | Notes                                  |
 | :--------- | :--------- | :---------- | :------------- | :------------------------------------- |
 | `hailo8`   | Hailo-8    | Accelerator | ✅              | DRAM-less AI Accelerator               |
 | `hailo8l`  | Hailo-8L   | Accelerator | ✅              | Smaller Hailo-8 variant                |
@@ -39,7 +39,7 @@ Pass the chip name via the `name=` argument:
 
 > **Host inference is supported only on Hailo accelerators (Hailo-8 / 8L / 10H).** The Hailo-15H / 15L are SoC targets — the compiled HEF must be deployed onto the device and executed there; HailoRT VDevice on a host cannot drive them. Ultralytics still **exports** for these targets, but `YOLO("…_hailo_model").predict(…)` on a host raises `NotImplementedError` for SoC HEFs.
 
-> **Note on `name=`** — Ultralytics' `name` argument also controls the run sub-directory under `runs/<task>/`. Following the same convention used by Rockchip RKNN, the Hailo export reuses it for the chip target, so a default Hailo export lands at `runs/<task>/hailo10h/`.
+> **Note on `name=`** — Ultralytics' `name` argument also controls the run sub-directory under `runs/<task>/`. Following the same convention used by Rockchip RKNN, the Hailo export reuses it for the device target, so a default Hailo export lands at `runs/<task>/hailo10h/`.
 
 ## Export
 
@@ -71,7 +71,7 @@ The export produces a `<stem>_hailo_model/` directory containing `<stem>.hef` an
 
 ### Calibration data — RAW RGB uint8 [0, 255]
 
-The auto-generated model script begins with `normalization([0,0,0],[255,255,255])`, meaning the chip divides input by 255 internally. **Calibration data and inference inputs must therefore be raw RGB `uint8` frames in `[0, 255]` — not pre-normalized `float [0, 1]`.** Ultralytics's standard YOLO calibration dataloader already produces uint8 frames, so the default flow should be used.
+The auto-generated model script begins with `normalization([0,0,0],[255,255,255])`, meaning the device divides input by 255 internally. **Calibration data and inference inputs must therefore be raw RGB `uint8` frames in `[0, 255]` — not pre-normalized `float [0, 1]`.** Ultralytics's standard YOLO calibration dataloader already produces uint8 frames, so the default flow should be used.
 
 For optimal quantization accuracy, supply **at least 1024 calibration images** (a warning fires below this threshold). Increase via the `fraction=` arg or pick a larger `data=` dataset. The YOLOv8 / YOLO11 examples above use `coco8.yaml` for speed; for production accuracy parity (and for any YOLO26 export), use a real calibration set such as `coco.yaml` or your own training data.
 
@@ -108,7 +108,7 @@ results = model.predict("bus.jpg")
 The Hailo runtime expects raw RGB `uint8` `[0, 255]` input. The standard Ultralytics predict pipeline emits a normalized float tensor; the backend silently casts it back to uint8 (matching the behavior of the Rockchip RKNN backend). `HailoBackend` reads `model_family` from the HEF directory's `metadata.yaml` and dispatches to the right decode path:
 
 - **YOLOv8 / YOLO11** — the on-device NMS emits per-class detection lists which the backend rescales to input-pixel coords. The `nms_scores_th` (conf), `nms_iou_th` (iou), and `max_proposals_per_class` (max_det) values are **compiled into the HEF at export time** — runtime `predict(conf=, iou=)` overrides do not apply. Re-export with the desired thresholds to change them.
-- **YOLO26** — the chip emits 6 raw conv outputs (3 strides × {box-reg, class-logits}); the backend builds anchors per stride, applies `dist2bbox` + sigmoid, and runs a top-k selection over (anchor × class) pairs on host (the same math as `Detect.postprocess` for end2end models).
+- **YOLO26** — the device emits 6 raw conv outputs (3 strides × {box-reg, class-logits}); the backend builds anchors per stride, applies `dist2bbox` + sigmoid, and runs a top-k selection over (anchor × class) pairs on host (the same math as `Detect.postprocess` for end2end models).
 
 Both paths return `(1, N, 6)` `[x1, y1, x2, y2, conf, cls]` in input-pixel coords and the predictor's end2end branch consumes them directly.
 

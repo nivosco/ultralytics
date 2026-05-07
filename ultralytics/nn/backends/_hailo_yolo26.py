@@ -149,14 +149,14 @@ def postprocess(
         ax = gx.reshape(-1)  # (H*W,)
         ay = gy.reshape(-1)
         dist = box.reshape(B, -1, 4)
-        l = dist[..., 0]
-        t = dist[..., 1]
-        r = dist[..., 2]
-        b_ = dist[..., 3]
-        x1 = (ax - l) * stride
-        y1 = (ay - t) * stride
-        x2 = (ax + r) * stride
-        y2 = (ay + b_) * stride
+        left = dist[..., 0]
+        top = dist[..., 1]
+        right = dist[..., 2]
+        bottom = dist[..., 3]
+        x1 = (ax - left) * stride
+        y1 = (ay - top) * stride
+        x2 = (ax + right) * stride
+        y2 = (ay + bottom) * stride
         boxes_stride = np.stack([x1, y1, x2, y2], axis=-1)  # (B, H*W, 4)
         scores_stride = 1.0 / (1.0 + np.exp(-cls.reshape(B, -1, nc)))  # sigmoid
         all_boxes.append(boxes_stride)

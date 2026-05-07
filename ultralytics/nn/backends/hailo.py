@@ -210,6 +210,15 @@ class HailoBackend(BaseBackend):
         if finalizer is not None and finalizer.alive:
             finalizer()  # invokes stack.close(); detaches itself
 
+    def __del__(self) -> None:
+        # Belt-and-braces fallback for refcount-driven teardown. weakref.finalize covers normal GC,
+        # but __del__ runs synchronously when the last reference drops in CPython, releasing the
+        # VDevice (and its hardware lock) before the next process tries to acquire the device.
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def forward(self, im: torch.Tensor) -> list[np.ndarray]:
         """Run synchronous inference on the Hailo accelerator.
 
