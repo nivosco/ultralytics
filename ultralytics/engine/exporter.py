@@ -22,6 +22,7 @@ IMX                     | `imx`                     | yolo26n_imx_model/
 RKNN                    | `rknn`                    | yolo26n_rknn_model/
 ExecuTorch              | `executorch`              | yolo26n_executorch_model/
 Axelera AI              | `axelera`                 | yolo26n_axelera_model/
+Hailo                   | `hailo`                   | yolo26n_hailo_model/
 
 Requirements:
     $ pip install "ultralytics[export]"
@@ -52,6 +53,7 @@ Inference:
                          yolo26n_rknn_model         # RKNN
                          yolo26n_executorch_model   # ExecuTorch
                          yolo26n_axelera_model      # Axelera AI
+                         yolo26n_hailo_model        # Hailo
 
 TensorFlow.js:
     $ cd .. && git clone https://github.com/zldrobit/tfjs-yolov5-example.git && cd tfjs-yolov5-example
@@ -152,6 +154,7 @@ def export_formats():
         ["RKNN", "rknn", "_rknn_model", False, False, ["batch", "name"]],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"]],
         ["Axelera AI", "axelera", "_axelera_model", False, False, ["batch", "int8", "fraction", "data"]],
+        ["Hailo", "hailo", "_hailo_model", False, False, ["batch", "int8", "fraction", "data", "name"]],
     ]
     return dict(zip(["Format", "Argument", "Suffix", "CPU", "GPU", "Arguments"], zip(*x)))
 
@@ -240,6 +243,7 @@ class Exporter:
         export_imx: Export model to IMX format.
         export_executorch: Export model to ExecuTorch format.
         export_axelera: Export model to Axelera format.
+        export_hailo: Export model to Hailo HEF format.
 
     Examples:
         Export a YOLO26 model to ONNX format
@@ -327,6 +331,36 @@ class Exporter:
             if model.task not in {"detect", "pose", "classify", "segment"}:
                 raise ValueError(
                     "IMX export only supported for detection, pose estimation, classification, and segmentation models."
+                )
+        if fmt == "hailo":
+            from ultralytics.utils.export.hailo import HAILO_DEVICES
+
+            if not LINUX:
+                raise NotImplementedError("Hailo export is only supported on Linux.")
+            if model.task != "detect":
+                raise ValueError(
+                    f"Hailo export currently only supports the 'detect' task, got task='{model.task}'."
+                )
+            # Family dispatch happens via detect-head introspection in export_hailo (end2end + reg_max).
+            # No filename regex — that breaks for renamed checkpoints and silently drops models from any
+            # YOLO variant that pairs the standard Detect head with the supported reg_max values.
+            if not self.args.int8:
+                raise ValueError(
+                    "Hailo export requires int8=True (the DFC compiles a quantized HEF; "
+                    "float export is not supported). Re-run with int8=True."
+                )
+            if not self.args.data:
+                self.args.data = TASK2CALIBRATIONDATA.get(model.task)
+            if not self.args.name:
+                raise ValueError(
+                    f"Hailo export requires name=<chip target>, one of {sorted(HAILO_DEVICES)}. "
+                    f"Example: format='hailo', name='hailo10h'. (Note: 'name=' is overloaded with the "
+                    f"run sub-directory; use 'project=' to control runs/<task>/<dir>.)"
+                )
+            self.args.name = self.args.name.lower()
+            if self.args.name not in HAILO_DEVICES:
+                raise ValueError(
+                    f"Invalid Hailo device '{self.args.name}'. Valid names are {sorted(HAILO_DEVICES)}."
                 )
         if not hasattr(model, "names"):
             model.names = default_class_names()
@@ -577,7 +611,12 @@ class Exporter:
             )
         if self.args.format == "axelera" and n < 100:
             LOGGER.warning(f"{prefix} >100 images required for Axelera calibration, found {n} images.")
-        elif self.args.format != "axelera" and n < 300:
+        elif self.args.format == "hailo" and n < 1024:
+            LOGGER.warning(
+                f"{prefix} >=1024 images recommended for optimal Hailo calibration accuracy, found {n} images. "
+                f"Increase 'fraction' or use a larger 'data' dataset."
+            )
+        elif self.args.format not in {"axelera", "hailo"} and n < 300:
             LOGGER.warning(f"{prefix} >300 images recommended for INT8 calibration, found {n} images.")
         return build_dataloader(dataset, batch=batch, workers=0, drop_last=True)  # required for batch loading
 
@@ -709,7 +748,7 @@ class Exporter:
             calibration_dataset = nncf.Dataset(self.get_int8_calibration_dataloader(prefix), self._transform_fn)
             if isinstance(self.model.model[-1], Detect):
                 # Includes all Detect subclasses like Segment, Pose, OBB, WorldDetect, YOLOEDetect
-                head_module_name = ".".join(list(self.model.named_modules())[-1][0].split(".")[:2])
+                head_module_name = f"model.{len(self.model.model) - 1}"
                 ignored_scope = nncf.IgnoredScope(  # ignore operations
                     patterns=[
                         f".*{head_module_name}/.*/Add",
@@ -973,6 +1012,64 @@ class Exporter:
             transform_fn=self._transform_fn,
             model_name=self.file.stem,
             metadata=self.metadata,
+            prefix=prefix,
+        )
+
+    @try_export
+    def export_hailo(self, prefix=colorstr("Hailo:")):
+        """Export YOLO model to Hailo HEF format via the Hailo Dataflow Compiler."""
+        from ultralytics.utils.export.hailo import _dataloader_to_numpy, onnx2hailo
+
+        self.args.opset = min(self.args.opset or 17, 17)  # Hailo DFC opset cap
+        f_onnx = self.export_onnx()
+        calibration = _dataloader_to_numpy(self.get_int8_calibration_dataloader(prefix))
+
+        # HailoBackend emits (1, N, 6) end2end predictions for both supported families, so advertise
+        # end2end so the predictor consumes them via the end2end short path.
+        self.metadata["end2end"] = True
+
+        # Cut the ONNX at the Detect head's conv leaves so the parser doesn't try to compile the DFL /
+        # dist2bbox / topk subgraph (NPU doesn't support topk/gather; PT version-specific shape ops in
+        # decode also break the parser). The 6 leaves vary by family:
+        #   yolov8/yolo11: cv2.{i}.2/Conv (4*reg_max ch), cv3.{i}.2/Conv (nc ch) — on-device NMS attaches
+        #   yolo26       : one2one_cv2.{i}.2/Conv (4 ch), one2one_cv3.{i}.2/Conv (nc ch) — host postprocess
+        detect_head = self.model.model[-1]
+        head_module_name = f"model.{len(self.model.model) - 1}"
+        # The end2end *property* on Detect falls back to True if `_end2end` is unset and `one2one_cv2`
+        # exists (end2end yaml flag triggers one2one_cv2 creation in __init__), so it's the reliable check.
+        # We dispatch by "end2end + DFL-free" rather than a class check so any future end2end+reg_max=1
+        # head reuses this path automatically; rename guards against silently inheriting the YOLO26 branch.
+        is_end2end_dfl_free = bool(getattr(detect_head, "end2end", False)) and getattr(detect_head, "reg_max", 16) == 1
+        model_family = "yolo26" if is_end2end_dfl_free else "yolov8"
+        if is_end2end_dfl_free:
+            cv2_prefix, cv3_prefix = "one2one_cv2", "one2one_cv3"
+        else:
+            cv2_prefix, cv3_prefix = "cv2", "cv3"
+        end_node_names = [
+            name
+            for i in range(3)
+            for name in (
+                f"/{head_module_name}/{cv2_prefix}.{i}/{cv2_prefix}.{i}.2/Conv",
+                f"/{head_module_name}/{cv3_prefix}.{i}/{cv3_prefix}.{i}.2/Conv",
+            )
+        ]
+
+        return onnx2hailo(
+            onnx_file=f_onnx,
+            output_dir=str(self.file).replace(self.file.suffix, f"_hailo_model{os.sep}"),
+            hw_arch=self.args.name,
+            task=self.model.task,
+            calibration_data=calibration,
+            conf=self.args.conf or 0.25,
+            iou=self.args.iou,
+            num_classes=len(self.model.names),
+            imgsz=tuple(self.imgsz),
+            max_det=self.args.max_det,
+            reg_max=getattr(detect_head, "reg_max", 16),
+            metadata=self.metadata,
+            model_name=self.file.stem,
+            model_family=model_family,
+            end_node_names=end_node_names,
             prefix=prefix,
         )
 

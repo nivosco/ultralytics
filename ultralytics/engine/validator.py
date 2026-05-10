@@ -23,6 +23,7 @@ Usage - formats:
                           yolo26n_rknn_model         # Rockchip RKNN
                           yolo26n_executorch_model   # ExecuTorch
                           yolo26n_axelera_model      # Axelera AI
+                          yolo26n_hailo_model        # Hailo
 """
 
 from __future__ import annotations

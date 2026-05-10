@@ -382,3 +382,82 @@ def test_export_axelera():
     assert Path(file).exists(), f"Axelera export failed, directory not found: {file}"
     # Note: Inference testing skipped as it requires Axelera hardware
     shutil.rmtree(file, ignore_errors=True)  # cleanup
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not LINUX, reason="Hailo export is only supported on Linux")
+def test_export_hailo():
+    """Test YOLO export to Hailo HEF format (yolov8 on-device NMS path).
+
+    Note: YOLO26 export is verified manually with a 1024-image calibration set — the Hailo Model Zoo
+    alls hardcodes calibset_size=1024 and adaround, neither of which work on the 4-image coco8 set
+    used here.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("hailo_sdk_client") is None:
+        pytest.skip("Hailo Dataflow Compiler ('hailo_sdk_client') not installed")
+    file = YOLO("yolov8n.pt").export(format="hailo", imgsz=64, data="coco8.yaml", int8=True, name="hailo10h")
+    assert Path(file).exists(), f"Hailo export failed, directory not found: {file}"
+    assert next(Path(file).rglob("*.hef"), None) is not None, f"No .hef found under: {file}"
+    metadata_path = Path(file) / "metadata.yaml"
+    assert metadata_path.exists(), f"metadata.yaml missing under: {file}"
+
+    from ultralytics.utils import YAML
+
+    metadata = YAML.load(metadata_path)
+    assert metadata.get("model_family") == "yolov8", (
+        f"Expected model_family='yolov8' in metadata, got {metadata.get('model_family')!r}"
+    )
+
+    # Note: Inference testing skipped as it requires Hailo hardware.
+    shutil.rmtree(file, ignore_errors=True)
+
+
+def test_hailo_yolo26_postprocess():
+    """Host-side YOLO26 decode: anchor + dist2bbox + sigmoid + topk + conf filter.
+
+    The on-device chip emits 6 raw conv tensors; the host must decode them into ``(1, N, 6)``. This
+    test plants single-anchor activations and asserts the decoded box matches the anchor's expected
+    pixel xyxy, the score clears the conf threshold, the top-k cap honors ``max_det``, and weak
+    activations get filtered.
+    """
+    import numpy as np
+
+    from ultralytics.nn.backends.hailo import HailoBackend
+
+    nc = 4
+    strides = [8]
+    box_bufs = [np.zeros((1, 4, 4, 4), dtype=np.float32)]
+    cls_bufs = [np.zeros((1, 4, 4, nc), dtype=np.float32)]
+    # Five strong activations + one below conf=0.1 (sigmoid(-3) ≈ 0.047). Anchor at (gy=0, gx=0)
+    # with l/t/r/b=1 → expected xyxy = [(0.5-1)*8, (0.5-1)*8, (0.5+1)*8, (0.5+1)*8] = [-4, -4, 12, 12].
+    box_bufs[0][0, 0, 0, :] = 1.0
+    cls_bufs[0][0, 0, 0, 0] = 5.0
+    cls_bufs[0][0, 0, 1, 1] = 4.0
+    cls_bufs[0][0, 0, 2, 2] = 3.0
+    cls_bufs[0][0, 0, 3, 3] = 2.0
+    cls_bufs[0][0, 1, 0, 0] = 1.0
+    cls_bufs[0][0, 1, 1, 1] = -3.0  # sigmoid ≈ 0.047 — below conf=0.1
+
+    out = HailoBackend._yolo26_postprocess(box_bufs, cls_bufs, strides=strides, nc=nc, max_det=3, conf=0.1)
+
+    assert out.shape == (1, 3, 6), f"max_det should cap to 3, got {out.shape}"
+    assert (out[0, :, 4] > 0.1).all(), "all survivors must clear conf"
+    np.testing.assert_allclose(out[0, 0, :4], [-4, -4, 12, 12], atol=1e-4)
+    assert int(out[0, 0, 5]) == 0
+
+
+@pytest.mark.skipif(not LINUX, reason="Hailo export pre-flight only runs on Linux")
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"int8": False, "name": "hailo10h"}, "int8=True"),  # silent int8 flip is now a hard error
+        ({"int8": True}, "name=<chip target>"),  # silent default chip is now a hard error
+        ({"int8": True, "name": "not-a-real-chip"}, "Invalid Hailo device"),  # unknown device
+    ],
+)
+def test_hailo_export_preflight_errors(kwargs, match):
+    """Pre-flight rejects misconfigured Hailo exports loudly instead of silently mutating user args."""
+    with pytest.raises(ValueError, match=match):
+        YOLO(MODEL).export(format="hailo", imgsz=32, data="coco8.yaml", **kwargs)

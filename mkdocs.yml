@@ -593,6 +593,7 @@ nav:
       - ExecuTorch: integrations/executorch.md
       - Google Colab: integrations/google-colab.md
       - Gradio: integrations/gradio.md
+      - Hailo: integrations/hailo.md
       - IBM Watsonx: integrations/ibm-watsonx.md
       - JupyterLab: integrations/jupyterlab.md
       - Kaggle: integrations/kaggle.md
@@ -759,6 +760,7 @@ nav:
               - base: reference/nn/backends/base.md
               - coreml: reference/nn/backends/coreml.md
               - executorch: reference/nn/backends/executorch.md
+              - hailo: reference/nn/backends/hailo.md
               - mnn: reference/nn/backends/mnn.md
               - ncnn: reference/nn/backends/ncnn.md
               - onnx: reference/nn/backends/onnx.md
@@ -837,6 +839,7 @@ nav:
               - coreml: reference/utils/export/coreml.md
               - engine: reference/utils/export/engine.md
               - executorch: reference/utils/export/executorch.md
+              - hailo: reference/utils/export/hailo.md
               - imx: reference/utils/export/imx.md
               - mnn: reference/utils/export/mnn.md
               - ncnn: reference/utils/export/ncnn.md

@@ -10,6 +10,7 @@ from .axelera import AxeleraBackend
 from .base import BaseBackend
 from .coreml import CoreMLBackend
 from .executorch import ExecuTorchBackend
+from .hailo import HailoBackend
 from .mnn import MNNBackend
 from .ncnn import NCNNBackend
 from .onnx import ONNXBackend, ONNXIMXBackend
@@ -26,6 +27,7 @@ __all__ = [
     "BaseBackend",
     "CoreMLBackend",
     "ExecuTorchBackend",
+    "HailoBackend",
     "MNNBackend",
     "NCNNBackend",
     "ONNXBackend",

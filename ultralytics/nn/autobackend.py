@@ -16,6 +16,7 @@ from .backends import (
     AxeleraBackend,
     CoreMLBackend,
     ExecuTorchBackend,
+    HailoBackend,
     MNNBackend,
     NCNNBackend,
     ONNXBackend,
@@ -110,6 +111,7 @@ class AutoBackend(nn.Module):
             | Triton Inference      | triton://model    |
             | ExecuTorch            | *.pte             |
             | Axelera AI            | *_axelera_model/  |
+            | Hailo                 | *_hailo_model/    |
 
     Attributes:
         backend (BaseBackend): The loaded inference backend instance.
@@ -153,6 +155,7 @@ class AutoBackend(nn.Module):
         "triton": TritonBackend,
         "executorch": ExecuTorchBackend,
         "axelera": AxeleraBackend,
+        "hailo": HailoBackend,
     }
 
     @torch.no_grad()
@@ -213,7 +216,7 @@ class AutoBackend(nn.Module):
             backend_kwargs["format"] = format
         self.backend = self._BACKEND_MAP[format](model, **backend_kwargs)
 
-        self.nhwc = format in {"coreml", "saved_model", "pb", "tflite", "edgetpu", "rknn"}
+        self.nhwc = format in {"coreml", "saved_model", "pb", "tflite", "edgetpu", "rknn", "hailo"}
         self.format = format
 
         # Ensure backend has names (fallback to default if not set by metadata)
