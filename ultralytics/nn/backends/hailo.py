@@ -228,40 +228,57 @@ class HailoBackend(BaseBackend):
                 chip's normalization layer; native ``uint8`` input is forwarded unchanged.
 
         Returns:
-            (list[np.ndarray]): Single-element list containing decoded predictions of shape ``(1, N, 6)``
-            in ``[x1, y1, x2, y2, conf, cls]`` input-pixel coords.
+            (list[np.ndarray]): Single-element list containing decoded predictions of shape
+            ``(B, N, 6)`` in ``[x1, y1, x2, y2, conf, cls]`` input-pixel coords. For ``B > 1`` the
+            second dimension is the per-batch maximum and shorter results are zero-padded; the
+            downstream end2end NMS filters those padded rows by ``conf > 0``.
         """
-        # im.shape is (B, H, W, C) post-permute. Both decode paths emit (1, N, 6); _yolo26_postprocess
-        # asserts B==1 internally, but _decode_nms ignores the batch dim, so guard here — before the
-        # torch→numpy copy (and float scale/clip/astype) so a B>1 input is rejected without that work.
-        if im.shape[0] != 1:
-            raise NotImplementedError(
-                f"HailoBackend currently only supports batch=1 inference, got input shape {tuple(im.shape)}."
-            )
-
+        # AutoBackend feeds us NHWC via permute(0, 2, 3, 1), which is non-contiguous. The chained
+        # `* 255.0 / clip / astype` preserves the source strides (numpy keeps the operand layout for
+        # ufuncs with a scalar), so HailoRT's set_buffer would reject the buffer. ascontiguousarray
+        # forces a fresh C-order copy in both branches.
         if im.dtype == torch.uint8:
-            x = np.ascontiguousarray(im.cpu().numpy())
+            x_full = np.ascontiguousarray(im.cpu().numpy())
         else:
-            # astype already returns a fresh contiguous array; no extra copy needed.
-            x = (im.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            x_full = np.ascontiguousarray((im.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8))
 
-        imgsz_h, imgsz_w = int(x.shape[1]), int(x.shape[2])
+        bs = x_full.shape[0]
+        imgsz_h, imgsz_w = int(x_full.shape[1]), int(x_full.shape[2])
 
-        self._bindings.input().set_buffer(x)
-        self._configured.run([self._bindings], self._infer_timeout_ms)
+        # Hailo accelerators process one image per inference call; batched val (e.g. batch=8 in the
+        # validator) reaches us as a (B, H, W, C) tensor and we serialize across the batch dim.
+        per_image: list[np.ndarray] = []
+        for i in range(bs):
+            x = np.ascontiguousarray(x_full[i : i + 1])
+            self._bindings.input().set_buffer(x)
+            self._configured.run([self._bindings], self._infer_timeout_ms)
 
-        if self._model_family == "yolo26":
-            return [
-                _hailo_yolo26.postprocess(
-                    self._yolo26_box_bufs, self._yolo26_cls_bufs, **self._yolo26_params
+            if self._model_family == "yolo26":
+                per_image.append(
+                    _hailo_yolo26.postprocess(
+                        self._yolo26_box_bufs, self._yolo26_cls_bufs, **self._yolo26_params
+                    )
                 )
-            ]
+            else:
+                # yolov8 / yolo11: on-device NMS, list[ndarray] of length num_classes.
+                raw = self._bindings.output().get_buffer()
+                if isinstance(raw, list) and raw and isinstance(raw[0], list):
+                    raw = raw[0]
+                per_image.append(self._decode_nms(raw, imgsz_h, imgsz_w, self._max_det))
 
-        # yolov8 / yolo11: on-device NMS, list[ndarray] of length num_classes.
-        raw = self._bindings.output().get_buffer()
-        if isinstance(raw, list) and raw and isinstance(raw[0], list):
-            raw = raw[0]
-        return [self._decode_nms(raw, imgsz_h, imgsz_w, self._max_det)]
+        if bs == 1:
+            return [per_image[0]]
+
+        # Pad ragged per-image (1, N_i, 6) detections to a common (B, N_max, 6) tensor so the
+        # predictor's end2end short path (which iterates the leading dim) can consume it. Padded
+        # rows are all-zero, so `pred[:, 4] > conf_thres` filters them out without extra masking.
+        n_max = max(p.shape[1] for p in per_image)
+        out = np.zeros((bs, n_max, 6), dtype=np.float32)
+        for i, p in enumerate(per_image):
+            n = p.shape[1]
+            if n:
+                out[i, :n] = p[0]
+        return [out]
 
     # YOLO26-specific dispatch + decode lives in ``_hailo_yolo26``; the static-method shim is kept so
     # tests/external callers can reference ``HailoBackend._classify_yolo26_buffers`` and
