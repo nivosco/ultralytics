@@ -497,23 +497,25 @@ def onnx2hailo(
             dfc_version = _resolve_dfc_version()
             mz_tag = _resolve_mz_tag(dfc_version, hw_arch)
             LOGGER.info(f"{prefix} using Hailo Model Zoo tag {mz_tag} (DFC {'.'.join(map(str, dfc_version))}).")
+            # Map an Ultralytics model name to its Hailo Model Zoo file stem
+            mz_stem = re.sub(r"^yolo11", "yolov11", model_name)
             yaml_path = _fetch_mz_file(
                 mz_tag,
-                f"hailo_model_zoo/cfg/networks/{model_name}.yaml",
+                f"hailo_model_zoo/cfg/networks/{mz_stem}.yaml",
                 output_dir,
             )
             if yaml_path is None:
                 raise NotImplementedError(
-                    f"{model_name!r} is not published in Hailo Model Zoo at {mz_tag}; pass model_script= "
+                    f"{mz_stem!r} is not published in Hailo Model Zoo at {mz_tag}; pass model_script= "
                     f"to compile a custom variant."
                 )
             mz_artifacts.append(yaml_path)
-            _validate_hw_support(yaml_path, model_name, hw_arch)
-            alls_path = _resolve_mz_alls(model_name, mz_tag, hw_arch, output_dir)
+            _validate_hw_support(yaml_path, mz_stem, hw_arch)
+            alls_path = _resolve_mz_alls(mz_stem, mz_tag, hw_arch, output_dir)
             mz_artifacts.append(alls_path)
             if model_family != "yolo26":
                 json_path = _fetch_and_patch_nms_config(
-                    alls_path, model_name, mz_tag, output_dir,
+                    alls_path, mz_stem, mz_tag, output_dir,
                     conf=conf, iou=iou, max_det=max_det,
                 )
                 mz_artifacts.append(json_path)
