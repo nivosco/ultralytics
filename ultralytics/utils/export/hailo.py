@@ -207,19 +207,20 @@ def _fetch_mz_file(
 
 
 def _validate_hw_support(yaml_path: Path, stem: str, hw_arch: str) -> None:
-    """Assert ``hw_arch`` is in the MZ network YAML's ``info.supported_hw_arch`` list.
+    """Assert ``hw_arch`` is in the MZ network YAML's ``info.supported_hw_arch`` list when present.
+
+    The MZ ``base.yaml`` defines ``supported_hw_arch`` covering every Hailo device, and per-network
+    YAMLs override it only when the model is restricted to a subset. When the per-network YAML does
+    not carry the field, treat the model as supported on any device and allow compilation.
 
     Raises:
-        NotImplementedError: If the YAML lacks ``info.supported_hw_arch`` or the arch isn't listed,
+        NotImplementedError: If the YAML carries ``info.supported_hw_arch`` and the arch isn't listed,
             naming the actually supported arches so the user can pick a compatible target.
     """
     data = YAML.load(yaml_path) or {}
     supported = (data.get("info") or {}).get("supported_hw_arch")
     if not supported:
-        raise NotImplementedError(
-            f"Hailo Model Zoo network YAML for {stem!r} has no 'info.supported_hw_arch' field at "
-            f"{yaml_path}; cannot validate the target device. Pass model_script= to bypass."
-        )
+        return
     if hw_arch not in supported:
         raise NotImplementedError(
             f"{stem} is not supported on {hw_arch!r} per the Hailo Model Zoo. Supported devices: "
