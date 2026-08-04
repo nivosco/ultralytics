@@ -86,7 +86,7 @@ Hailo export is INT8-only. Ultralytics automatically downloads a task-specific c
 
 !!! danger "Use at least 1,024 calibration images for best accuracy"
 
-    Ultralytics forces DFC optimization level 2 and configures fine-tuning to use the actual calibration dataset size. Hailo recommends at least 1,024 diverse images; the built-in lightweight datasets compile at level 2 but may not represent the production domain. For production HEF exports, pass a representative dataset using `data="path/to/dataset.yaml"`.
+    Ultralytics uses DFC optimization level 2 and configures fine-tuning to use the actual calibration dataset size. Hailo recommends at least 1,024 diverse images; the built-in lightweight datasets compile at level 2 but may not represent the production domain. YOLO26 detection additionally switches to the Hailo Model Zoo quantization recipe at 1,024 or more images — see [Accuracy Expectations by Model Family](#accuracy-expectations-by-model-family). For production HEF exports, pass a representative dataset using `data="path/to/dataset.yaml"`.
 
 ```python
 model.export(format="hailo", name="hailo8l", data="path/to/dataset.yaml")
@@ -186,6 +186,15 @@ Measured on a Hailo-8L with in-domain calibration (COCO128, 128 images), INT8 HE
 
 Retention compares both models at the same confidence threshold. YOLOv8 and YOLO11 HEFs bake the export-time `conf` (default 0.25) into the on-chip NMS, so validating against a PyTorch baseline at its default low threshold integrates a larger part of the precision-recall curve and overstates the quantization gap.
 
+The YOLO26 row above reflects the level-2 recipe that a 128-image calibration set selects. With 1,024 or more calibration images the exporter switches YOLO26 detection to the Hailo Model Zoo recipe — optimization level 4 without compression, `adaround` post-quantization, and 16-bit precision on the head and depthwise convolutions. Hailo publishes COCO mAP for that configuration in the [Hailo Model Zoo](https://github.com/hailo-ai/hailo_model_zoo/tree/master/docs/public_models):
+
+| Model   | PyTorch mAP | Hailo-8 / Hailo-8L | Hailo-10H  |
+| :------ | :---------- | :----------------- | :--------- |
+| YOLO26n | 40.0        | 38.4 (96%)         | 38.6 (97%) |
+| YOLO26s | 47.5        | 45.3 (95%)         | 45.8 (96%) |
+
+Those figures are mAP averaged over IoU 0.50:0.95 on the full COCO validation set, so they are not directly comparable with the mAP50 retention percentages in the first table. Pass `data="coco.yaml"` or another dataset with at least 1,024 images to compile YOLO26 with this recipe.
+
 Beyond detection, the segmentation, pose, OBB, and classification exporter paths were validated on the same Hailo-8L (DFC 3.33, HailoRT 4.23). Each INT8 HEF was compared with its PyTorch checkpoint on the same validation split, using in-domain calibration:
 
 | Task                  | Metric (validation split)          | YOLOv8n | YOLO11n |
@@ -200,8 +209,8 @@ Segmentation, pose, and OBB were calibrated with each task's default in-domain s
 Three practical rules follow from device measurements:
 
 1. **Calibrate in-domain, always.** Fine-tuning with out-of-domain images is equivalent to disabling fine-tuning entirely: a YOLO26n calibrated with 1,238 out-of-domain images retains the same accuracy (85.7%) as one compiled without fine-tuning. A small in-domain set beats a large out-of-domain one.
-2. **Lower `conf` by about 0.05 for YOLO26 deployments.** Quantization shifts YOLO26 scores down by roughly 0.05 on average, so a threshold tuned in PyTorch drops valid detections on the HEF. Using `conf=0.20` on device matches the detection count of PyTorch at `conf=0.25`, and lowering slightly further (around `conf=0.15`) recovers essentially all of the remaining mAP50 gap at the cost of more low-confidence detections. Quantization also re-ranks roughly 20% of detections — a permanent ordering effect that no threshold undoes — but that reshuffling does not block mAP50 recovery at the lower threshold.
-3. **The attention penalty is structural on Hailo-8/8L (DFC 3.33).** The attention blocks compile to `matmul` operations that keep INT8 activation inputs in every mode the compiler offers for them; the 16-bit-output mode fails allocation for this graph, and raising the precision of the surrounding layers does not help because the matmul requantizes its inputs to INT8 anyway (protecting the depthwise and output convolutions at 16-bit left mAP unchanged in our tests). When accuracy is the priority and the model is interchangeable, YOLO11 currently quantizes better than YOLO26 here; newer Hailo generations (DFC 5.x) expose more mixed-precision options and may differ.
+2. **Lower `conf` by about 0.05 for YOLO26 compiled at level 2.** With fewer than 1,024 calibration images, quantization shifts YOLO26 scores down by roughly 0.05 on average, so a threshold tuned in PyTorch drops valid detections on the HEF. Using `conf=0.20` on device matches the detection count of PyTorch at `conf=0.25`, and lowering slightly further (around `conf=0.15`) recovers essentially all of the remaining mAP50 gap at the cost of more low-confidence detections. Quantization also re-ranks roughly 20% of detections — a permanent ordering effect that no threshold undoes — but that reshuffling does not block mAP50 recovery at the lower threshold.
+3. **Give YOLO26 a full calibration set on Hailo-8/8L (DFC 3.33).** The attention blocks compile to `matmul` operations that keep INT8 activation inputs in every mode the compiler offers for them, and the 16-bit-output mode fails allocation for this graph. Raising the precision of the surrounding layers does not recover the loss on its own — protecting the depthwise and output convolutions at 16-bit left mAP unchanged at optimization level 2 — but combined with level-4 optimization and `adaround`, which the exporter selects at 1,024 or more calibration images, it does. That is the configuration behind the Hailo Model Zoo figures above; newer Hailo generations (DFC 5.x) expose more mixed-precision options again.
 
 ## Exported Artifacts
 
@@ -332,7 +341,7 @@ DFC optimization is the most expensive stage. Compilation time increases with mo
 
 ### Quantized Model Accuracy Drops
 
-Use calibration images that resemble production inputs and include the important objects, scales, lighting conditions, and backgrounds. Compare the original PyTorch model and exported HEF on the same validation set before deployment. A moderate family-dependent gap remains even with good calibration; see [Accuracy Expectations by Model Family](#accuracy-expectations-by-model-family) for the measured baselines.
+Use calibration images that resemble production inputs and include the important objects, scales, lighting conditions, and backgrounds. Compare the original PyTorch model and exported HEF on the same validation set before deployment. Calibration set size matters as well as content: YOLO26 detection selects a stronger quantization recipe at 1,024 or more images. See [Accuracy Expectations by Model Family](#accuracy-expectations-by-model-family) for the measured baselines.
 
 ### HEF Does Not Load on the Device
 
