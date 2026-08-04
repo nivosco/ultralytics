@@ -10,10 +10,6 @@ Hailo AI accelerators run compiled Hailo Executable Format (HEF) models on edge 
 
 Hailo deployment is designed for computer vision at the edge: cameras, robots, industrial systems, gateways, and other devices that need local object detection without sending every frame to the cloud. A compiled HEF contains the quantized network, hardware allocation, scheduling, and optional HailoRT post-processing needed by the selected accelerator.
 
-!!! note "Compare newer edge accelerators"
-
-    For new hardware deployments, also evaluate [Axelera](axelera.md) and [DeepX](deepx.md), which target newer edge accelerator platforms and may offer higher performance. Hailo recommends at least 1,024 representative calibration images for best accuracy; the built-in task-specific datasets are suitable only for quick testing.
-
 ## Why Deploy Ultralytics YOLO on Hailo?
 
 Combining Ultralytics YOLO with a Hailo neural processing unit (NPU) provides a practical path from model training to low-power edge AI inference. Common use cases include:
@@ -86,7 +82,7 @@ Hailo export is INT8-only. Ultralytics automatically downloads a task-specific c
 
 !!! danger "Use at least 1,024 calibration images for best accuracy"
 
-    Ultralytics forces DFC optimization level 2 and configures fine-tuning to use the actual calibration dataset size. Hailo recommends at least 1,024 diverse images; the built-in lightweight datasets compile at level 2 but may not represent the production domain. For production HEF exports, pass a representative dataset using `data="path/to/dataset.yaml"`.
+    Ultralytics forces DFC optimization level 2 and configures fine-tuning to use the actual calibration dataset size. Hailo recommends at least 1,024 diverse images; the built-in task-specific datasets compile at level 2 and are suitable only for quick testing, not for the production domain. For production HEF exports, pass a representative dataset using `data="path/to/dataset.yaml"`.
 
 ```python
 model.export(format="hailo", name="hailo8l", data="path/to/dataset.yaml")
